@@ -10,12 +10,7 @@ from torch_helpers.nn.embeddings import Embedding
 
 
 class RGCN(nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        num_layers: int,
-    ):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int):
         super().__init__()
 
         self._layers = nn.ModuleList([RGCN.Layer(input_size, hidden_size)])
@@ -44,8 +39,10 @@ class RGCN(nn.Module):
 
     class Layer(nn.Module):
         """
-        Be careful
-        Self Evolution
+        Notice:
+        This implementation of RGCN Layer is not equivalent to the one decribed in the paper.
+        In the paper, there is another self-evolve weight matrix(nn.Linear) for those entities do not exist in current graph.
+        We migrate it with `self._loop_linear` here for simplicity.
         """
 
         def __init__(self, input_size: int, hidden_size: int):
@@ -67,7 +64,6 @@ class RGCN(nn.Module):
 
             Return:
                 output: (num_nodes, hidden_size)
-
             """
             if features:
                 nodes, edges = features
@@ -123,7 +119,7 @@ class EvolutionUnit(nn.Module):
         Returns:
 
         """
-        # edges evolution
+        # relaltion evolution
         rel_ent_embed = torch.zeros_like(rel_embed)
         for rel, rel_ent_ids in graph.rel_to_ent.items():
             embed = torch.mean(ent_embed[rel_ent_ids], dim=0)
@@ -131,7 +127,7 @@ class EvolutionUnit(nn.Module):
 
         r_rel_embed = torch.cat([rel_embed, rel_ent_embed], dim=-1)
         n_rel_embed = tf.normalize(self._gru(r_rel_embed, rel_embed))
-        # nodes evolution
+        # entity evolution
         w_ent_embed = self._rgcn(graph, ent_embed, n_rel_embed)
         w_ent_embed = tf.normalize(w_ent_embed)
         u = torch.sigmoid(self._linear(ent_embed))
@@ -161,7 +157,6 @@ class RecurrentRGCN(nn.Module):
 
     def forward(self, snapshots: List[dgl.DGLGraph]):
         """
-
         Arguments:
             snapshot: [his_len]
             entity_embedding: (num_entities, input_size)
@@ -310,12 +305,12 @@ class ConvTransE(nn.Module):
 
         """
         # (num_triplets, embed_size)
-        head_embedding = nodes.index_select(0, heads).unsqueeze(dim=1)
-        rel_embedding = nodes.index_select(0, relations).unsqueeze(dim=1)
+        head_embedding = nodes[heads]
+        rel_embedding = nodes[relations]
         # (num_triplets, 2, embed_size)
-        x = torch.cat([head_embedding, rel_embedding], dim=1)
+        x = torch.stack([head_embedding, rel_embedding], dim=1)
         embedding = self._backbone(nodes, edges, x)
-        return (embedding @ nodes.transpose()).sigmoid()
+        return torch.sigmoid(embedding @ nodes.t())
 
 
 class ConvTransR(nn.Module):
@@ -346,9 +341,9 @@ class ConvTransR(nn.Module):
             tail: (num_triplets,)
         """
         # (num_triplets, embed_size)
-        head_embedding = nodes.index_select(0, heads).unsqueeze(dim=1)
-        tail_embedding = nodes.index_select(0, tails).unsqueeze(dim=1)
+        head_embedding = nodes[heads]
+        tail_embedding = nodes[tails]
         # (num_triplets, 2, embed_size)
-        x = torch.cat([head_embedding, tail_embedding], dim=1)
+        x = torch.stack([head_embedding, tail_embedding], dim=1)
         embedding = self._backbone(x)
-        return (embedding @ edges.t()).sigmoid()
+        return torch.sigmoid(embedding @ edges.t())

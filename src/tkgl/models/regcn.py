@@ -231,6 +231,11 @@ class RecurrentRGCNForLinkPrediction(nn.Module):
 
 
 class ConvTransBackbone(nn.Module):
+    """
+    The backbone module for ConvTransE and ConvTransR.
+    The Conv1d here is not a common way to process NLP features.
+    """
+
     def __init__(
         self,
         hidden_size: int,
@@ -246,7 +251,7 @@ class ConvTransBackbone(nn.Module):
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
-            padding=(kernel_size - 1) // 2,
+            padding="same",
         )
         self._bn1 = nn.BatchNorm1d(out_channels)
         self._dp1 = nn.Dropout(dropout)
@@ -262,7 +267,7 @@ class ConvTransBackbone(nn.Module):
         Arguments:
             inputs: (num_triplets, in_channels, hidden_size)
         Return:
-            output: (num_triplets, embed_size)
+            output: (num_triplets, hidden_size)
         """
         num_triplets = inputs.size(0)
         # (num_triplets, out_channels, embed_size)
@@ -277,11 +282,15 @@ class ConvTransBackbone(nn.Module):
 
 class ConvTransE(nn.Module):
     def __init__(
-        self, embed_size: int, channels: int, kernel_size: int, dropout: float
+        self,
+        hidden_size: int,
+        channels: int,
+        kernel_size: int,
+        dropout: float,
     ):
         super().__init__()
         self._backbone = ConvTransBackbone(
-            embed_size,
+            hidden_size,
             in_channels=2,
             out_channels=channels,
             kernel_size=kernel_size,
@@ -297,17 +306,17 @@ class ConvTransE(nn.Module):
     ):
         """
         Arguments:
-            nodes: (num_nodes, embed_size)
-            edges: (num_edges, embed_size)
+            nodes: (num_nodes, hidden_size)
+            edges: (num_edges, hidden_size)
             heads: (num_triplets,)
             relations: (num_triplets,)
         Return:
 
         """
-        # (num_triplets, embed_size)
+        # (num_triplets, hidden_size)
         head_embedding = nodes[heads]
         rel_embedding = nodes[relations]
-        # (num_triplets, 2, embed_size)
+        # (num_triplets, 2, hidden_size)
         x = torch.stack([head_embedding, rel_embedding], dim=1)
         embedding = self._backbone(nodes, edges, x)
         return torch.sigmoid(embedding @ nodes.t())

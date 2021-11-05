@@ -105,7 +105,8 @@ class EvolutionUnit(nn.Module):
     def forward(
         self,
         graph: dgl.DGLGraph,
-        ent_embed: torch.Tensor,
+        ent_hidden: torch.Tensor,
+        rel_hidden: torch.Tensor,
         rel_embed: torch.Tensor,
     ):
         """
@@ -120,20 +121,74 @@ class EvolutionUnit(nn.Module):
 
         """
         # relaltion evolution
-        rel_ent_embed = torch.zeros_like(rel_embed)
+        rel_ent_embed = torch.zeros_like(rel_hidden)
         for rel, rel_ent_ids in graph.rel_to_ent.items():
-            embed = torch.mean(ent_embed[rel_ent_ids], dim=0)
+            embed = torch.mean(ent_hidden[rel_ent_ids], dim=0)
             rel_ent_embed[rel] = embed
 
         r_rel_embed = torch.cat([rel_embed, rel_ent_embed], dim=-1)
-        n_rel_embed = tf.normalize(self._gru(r_rel_embed, rel_embed))
+        n_rel_embed = tf.normalize(self._gru(r_rel_embed, rel_hidden))
         # entity evolution
-        w_ent_embed = self._rgcn(graph, ent_embed, n_rel_embed)
+        w_ent_embed = self._rgcn(graph, ent_hidden, n_rel_embed)
         w_ent_embed = tf.normalize(w_ent_embed)
-        u = torch.sigmoid(self._linear(ent_embed))
-        n_ent_embed = ent_embed + u * (w_ent_embed - ent_embed)
+        u = torch.sigmoid(self._linear(ent_hidden))
+        n_ent_embed = ent_hidden + u * (w_ent_embed - ent_hidden)
 
         return n_ent_embed, n_rel_embed
+
+
+class REGCN(nn.Module):
+    def __init__(
+        self,
+        num_entities: int,
+        num_relations: int,
+        hidden_size: int,
+        num_layers: int,
+        kernel_size: int,
+        channels: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self._rrgcn = RecurrentRGCN(
+            num_entities,
+            num_relations,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+        )
+        self._rel = ConvTransR(
+            hidden_size=hidden_size,
+            channels=channels,
+            kernel_size=kernel_size,
+            dropout=dropout,
+        )
+        self._ent = ConvTransE(
+            hidden_size=hidden_size,
+            channels=channels,
+            kernel_size=kernel_size,
+            dropout=dropout,
+        )
+
+    def forward(
+        self,
+        snapshots: List[dgl.DGLGraph],
+        head: torch.Tensor,
+        rel: torch.Tensor,
+        tail: torch.Tensor,
+    ):
+        """
+
+        Arguments:
+            snapshot: [his_len]
+            triplets: (num_triplets, 3)
+
+        Returns:
+            logits: (num_triplets, num_entities)
+        """
+        evolution_outputs = self._rrgcn(snapshots)
+        e_h, r_h = evolution_outputs["last"]
+        rel_logit = self._rel(e_h, r_h, head, tail)
+        tail_logit = self._ent(e_h, r_h, head, rel)
+        return {"tail_logit": tail_logit, "rel_logit": rel_logit}
 
 
 class RecurrentRGCN(nn.Module):
@@ -170,10 +225,10 @@ class RecurrentRGCN(nn.Module):
             last_relation: (num_relations, hidden_size)
         """
 
-        e_h, r_h = self._ent_embed, self._rel_embed
+        e_h, r_h = tf.normalize(self._ent_embed), self._rel_embed
         ent_embeds, rel_embeds = [], []
         for graph in snapshots:
-            e_h, r_h = self._evolution(graph, e_h, r_h)
+            e_h, r_h = self._evolution(graph, e_h, r_h, self._rel_embed)
             ent_embeds.append(e_h)
             rel_embeds.append(r_h)
 
@@ -187,8 +242,8 @@ class RecurrentRGCN(nn.Module):
 class RecurrentRGCNForLinkPrediction(nn.Module):
     def __init__(
         self,
-        ent_embedding: Embedding,
-        rel_embedding: Embedding,
+        num_entities: int,
+        num_relations: int,
         hidden_size: int,
         num_layers: int,
         kernel_size: int,
@@ -197,8 +252,8 @@ class RecurrentRGCNForLinkPrediction(nn.Module):
     ):
         super().__init__()
         self._rrgcn = RecurrentRGCN(
-            ent_embedding,
-            rel_embedding,
+            num_entities,
+            num_relations,
             hidden_size=hidden_size,
             num_layers=num_layers,
         )
@@ -227,7 +282,7 @@ class RecurrentRGCNForLinkPrediction(nn.Module):
         evolution_outputs = self._rrgcn(snapshots)
         e_h, r_h = evolution_outputs["last"]
         outputs = self._lp(e_h, r_h, head, tail)
-        return {"logits": outputs}
+        return {"rel_logit": outputs}
 
 
 class ConvTransBackbone(nn.Module):
@@ -251,7 +306,7 @@ class ConvTransBackbone(nn.Module):
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
-            padding="same",
+            padding=(kernel_size - 1) // 2,
         )
         self._bn1 = nn.BatchNorm1d(out_channels)
         self._dp1 = nn.Dropout(dropout)
@@ -318,7 +373,7 @@ class ConvTransE(nn.Module):
         rel_embedding = nodes[relations]
         # (num_triplets, 2, hidden_size)
         x = torch.stack([head_embedding, rel_embedding], dim=1)
-        embedding = self._backbone(nodes, edges, x)
+        embedding = self._backbone(x)
         return torch.sigmoid(embedding @ nodes.t())
 
 

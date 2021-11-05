@@ -10,13 +10,12 @@ import dgl
 import py_helpers
 import torch
 from dgl.udf import EdgeBatch
-from py_helpers.collections import DictDataClass
 from torch_helpers import Vocab, vocab
 from torch_helpers.datasets import Batch, Dataset
 
 
 @dataclasses.dataclass()
-class Quadruple(DictDataClass):
+class Quadruple:
     head: Hashable
     rel: Hashable
     tail: Hashable

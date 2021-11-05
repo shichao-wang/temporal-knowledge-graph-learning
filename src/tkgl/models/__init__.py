@@ -1,3 +1,3 @@
-from .regcn import RecurrentRGCN, RecurrentRGCNForLinkPrediction
+from .regcn import REGCN, RecurrentRGCN, RecurrentRGCNForLinkPrediction
 
-__all__ = ["RecurrentRGCN", "RecurrentRGCNForLinkPrediction"]
+__all__ = ["RecurrentRGCN", "RecurrentRGCNForLinkPrediction", "REGCN"]

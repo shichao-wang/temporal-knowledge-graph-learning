@@ -6,7 +6,6 @@ import torch_helpers
 from dgl.udf import EdgeBatch, NodeBatch
 from torch import nn
 from torch.nn import functional as tf
-from torch_helpers.nn.embeddings import Embedding
 
 
 class RGCN(nn.Module):
@@ -29,13 +28,13 @@ class RGCN(nn.Module):
             ent_embed: (num_nodes, input_size)
             rel_embed: (num_edges, input_size)
         """
-        with graph.local_scope():
-            graph.ndata["h"] = ent_embed
-            graph.edata["h"] = rel_embed[graph.edata["rel_id"]]
-            for layer in self._layers:
-                _ = layer(graph)
+        # with graph.local_scope():
+        graph.ndata["h"] = ent_embed
+        graph.edata["h"] = rel_embed[graph.edata["rel_id"]]
+        for layer in self._layers:
+            _ = layer(graph)
 
-            return graph.ndata["h"]
+        return graph.ndata["h"]
 
     class Layer(nn.Module):
         """
@@ -122,9 +121,12 @@ class EvolutionUnit(nn.Module):
         """
         # relaltion evolution
         rel_ent_embed = torch.zeros_like(rel_hidden)
-        for rel, rel_ent_ids in graph.rel_to_ent.items():
-            embed = torch.mean(ent_hidden[rel_ent_ids], dim=0)
-            rel_ent_embed[rel] = embed
+        rel_ent_embeds = torch.split_with_sizes(
+            ent_hidden[graph.rel_node_ids], graph.rel_len
+        )
+        for rel, ent_embeds in enumerate(rel_ent_embeds):
+            if ent_embeds.size(0) != 0:
+                rel_ent_embed[rel] = torch.mean(ent_embeds, dim=0)
 
         r_rel_embed = torch.cat([rel_embed, rel_ent_embed], dim=-1)
         n_rel_embed = tf.normalize(self._gru(r_rel_embed, rel_hidden))

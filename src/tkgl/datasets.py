@@ -91,7 +91,7 @@ class QuadrupleLoader:
 
     def build_graph(self, triplets: List[Quadruple]) -> dgl.DGLGraph:
         src_ids, dst_ids, rel_ids = [], [], []
-        r2e = defaultdict(list)
+        r2e = defaultdict(set)
         for trip in triplets:
             u = self._vocabs["entity"].convert_token_to_id(trip.head)
             v = self._vocabs["entity"].convert_token_to_id(trip.tail)
@@ -99,15 +99,22 @@ class QuadrupleLoader:
             src_ids.append(u)
             dst_ids.append(v)
             rel_ids.append(e)
-            r2e[e].extend([u, v])
+            r2e[e].update([u, v])
 
-        # unique_v = sorted(set(src_ids) | set(dst_ids))
         node_ids = self._vocabs["entity"].convert_tokens_to_ids(
             self._vocabs["entity"]
         )
 
         graph = dgl.graph([])
-        graph.rel_to_ent = r2e
+
+        rel_node_ids = []
+        rel_len = []
+        for rel_id in range(self._vocabs["relation"].max_index):
+            rel_node_ids.extend(r2e[rel_id])
+            rel_len.append(len(r2e[rel_id]))
+        graph.rel_node_ids = rel_node_ids
+        graph.rel_len = rel_len
+
         graph.add_nodes(
             len(node_ids),
             data={"ent_id": torch.as_tensor(node_ids)},

@@ -5,6 +5,7 @@ import py_helpers
 import torch_helpers
 from torch import optim
 from torch.utils.data import DataLoader
+from torch_helpers.engine import callbacks
 
 import tkgl
 
@@ -42,8 +43,17 @@ def main():
         channels=args.channels,
         dropout=args.dropout,
     )
+    metric = tkgl.RelPredictionMetric()
     engine = torch_helpers.AccelerateEngine(
-        model, metric=tkgl.RelPredictionMetric()
+        model,
+        callback_list=[
+            callbacks.ModelSave(
+                save_folder_path="./saved_models/regcn",
+                model_template="regcn-epoch_{epoch}-mrr{val[r_mrr]:.6f}.pt",
+                metric_value="+r_mrr",
+                n=3,
+            )
+        ],
     )
 
     train_data = DataLoader(datasets["train"], shuffle=True, batch_size=None)
@@ -52,12 +62,13 @@ def main():
         criterion=tkgl.TKGCriterion(),
         optimizer=optim.Adam(model.parameters(), lr=args.lr),
         num_steps=len(train_data) * 10,
+        metric=metric,
         val_data={
-            "Val": DataLoader(datasets["val"], batch_size=None),
-            "Test": DataLoader(datasets["test"], batch_size=None),
+            "val": DataLoader(datasets["val"], batch_size=None),
+            "test": DataLoader(datasets["test"], batch_size=None),
         },
     )
-    metrics = engine.test(DataLoader(datasets["test"], batch_size=None))
+    metrics = engine.test(DataLoader(datasets["test"], batch_size=None), metric)
     pprint.pprint(metrics)
 
 

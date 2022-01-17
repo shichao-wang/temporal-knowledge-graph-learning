@@ -2,10 +2,12 @@ from typing import List, Tuple
 
 import dgl
 import torch
-import torch_helpers
+import torch_helpers as th
 from dgl.udf import EdgeBatch, NodeBatch
 from torch import nn
 from torch.nn import functional as tf
+
+import tkgl
 
 
 class RGCN(nn.Module):
@@ -151,115 +153,24 @@ class REGCN(nn.Module):
         dropout: float,
     ):
         super().__init__()
-        self._rrgcn = RecurrentRGCN(
-            num_entities,
-            num_relations,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-        )
-        self._rel = ConvTransR(
-            hidden_size=hidden_size,
-            channels=channels,
-            kernel_size=kernel_size,
-            dropout=dropout,
-        )
-        self._ent = ConvTransE(
-            hidden_size=hidden_size,
-            channels=channels,
-            kernel_size=kernel_size,
-            dropout=dropout,
-        )
-
-    def forward(
-        self,
-        snapshots: List[dgl.DGLGraph],
-        head: torch.Tensor,
-        rel: torch.Tensor,
-        tail: torch.Tensor,
-    ):
-        """
-
-        Arguments:
-            snapshot: [his_len]
-            triplets: (num_triplets, 3)
-
-        Returns:
-            logits: (num_triplets, num_entities)
-        """
-        evolution_outputs = self._rrgcn(snapshots)
-        e_h, r_h = evolution_outputs["last"]
-        rel_logit = self._rel(e_h, r_h, head, tail)
-        tail_logit = self._ent(e_h, r_h, head, rel)
-        return {"tail_logit": tail_logit, "rel_logit": rel_logit}
-
-
-class RecurrentRGCN(nn.Module):
-    def __init__(
-        self,
-        num_entities: int,
-        num_relations: int,
-        hidden_size: int,
-        num_layers: int,
-    ):
-        super().__init__()
-        ent_weight = torch_helpers.nn.random_init_embedding_weight(
+        ent_weight = th.nn.random_init_embedding_weight(
             num_entities, hidden_size
         )
-        rel_weight = torch_helpers.nn.random_init_embedding_weight(
+        rel_weight = th.nn.random_init_embedding_weight(
             num_relations, hidden_size
         )
-        self._ent_embed = nn.Parameter(ent_weight)
-        self._rel_embed = nn.Parameter(rel_weight)
+        self._ent_embeds = nn.Parameter(ent_weight)
+        self._rel_embeds = nn.Parameter(rel_weight)
+
         self._evolution = EvolutionUnit(hidden_size, hidden_size, num_layers)
 
-    def forward(self, snapshots: List[dgl.DGLGraph]):
-        """
-        Arguments:
-            snapshot: [his_len]
-            entity_embedding: (num_entities, input_size)
-            relation_embedding: (num_relations, input_size)
-
-        Returns:
-            entity: (his_len, num_nodes, hidden_size)
-                The node embeddings for each snapshot
-            relations: (his_len, num_relations, hidden_size)
-            last_entity: (num_nodes, hidden_size)
-            last_relation: (num_relations, hidden_size)
-        """
-
-        e_h, r_h = tf.normalize(self._ent_embed), self._rel_embed
-        ent_embeds, rel_embeds = [], []
-        for graph in snapshots:
-            e_h, r_h = self._evolution(graph, e_h, r_h, self._rel_embed)
-            ent_embeds.append(e_h)
-            rel_embeds.append(r_h)
-
-        return {
-            "entity": torch.stack(ent_embeds),
-            "relation": torch.stack(rel_embeds),
-            "last": (e_h, r_h),
-        }
-
-
-class RecurrentRGCNForLinkPrediction(nn.Module):
-    def __init__(
-        self,
-        num_entities: int,
-        num_relations: int,
-        hidden_size: int,
-        num_layers: int,
-        kernel_size: int,
-        channels: int,
-        dropout: float,
-    ):
-        super().__init__()
-        self._rrgcn = RecurrentRGCN(
-            num_entities,
-            num_relations,
+        self._rel_decoder = tkgl.nn.ConvTransR(
             hidden_size=hidden_size,
-            num_layers=num_layers,
+            channels=channels,
+            kernel_size=kernel_size,
+            dropout=dropout,
         )
-        self._lp = ConvTransR(
+        self._ent_decoder = tkgl.nn.ConvTransE(
             hidden_size=hidden_size,
             channels=channels,
             kernel_size=kernel_size,
@@ -269,8 +180,9 @@ class RecurrentRGCNForLinkPrediction(nn.Module):
     def forward(
         self,
         snapshots: List[dgl.DGLGraph],
-        head: torch.Tensor,
-        tail: torch.Tensor,
+        subj: torch.Tensor,
+        rel: torch.Tensor,
+        obj: torch.Tensor,
     ):
         """
 
@@ -281,135 +193,13 @@ class RecurrentRGCNForLinkPrediction(nn.Module):
         Returns:
             logits: (num_triplets, num_entities)
         """
-        evolution_outputs = self._rrgcn(snapshots)
-        e_h, r_h = evolution_outputs["last"]
-        outputs = self._lp(e_h, r_h, head, tail)
-        return {"rel_logit": outputs}
+        ent_embeds = self._ent_embeds
+        rel_embeds = self._rel_embeds
+        for graph in snapshots:
+            ent_embeds, rel_embeds = self._evolution(
+                graph, ent_embeds, rel_embeds, self._rel_embeds
+            )
+        rel_logit = self._rel_decoder(ent_embeds, rel_embeds, subj, obj)
+        ent_logit = self._ent_decoder(ent_embeds, rel_embeds, subj, rel)
 
-
-class ConvTransBackbone(nn.Module):
-    """
-    The backbone module for ConvTransE and ConvTransR.
-    The Conv1d here is not a common way to process NLP features.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        dropout: float,
-    ):
-        super().__init__()
-        self._bn = nn.BatchNorm1d(in_channels)
-        self._dp = nn.Dropout(dropout)
-        self._conv1 = nn.Conv1d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            padding=(kernel_size - 1) // 2,
-        )
-        self._bn1 = nn.BatchNorm1d(out_channels)
-        self._dp1 = nn.Dropout(dropout)
-        self._linear = nn.Linear(hidden_size * out_channels, hidden_size)
-        self._bn2 = nn.BatchNorm1d(hidden_size)
-        self._dp2 = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        inputs: torch.Tensor,
-    ):
-        """
-        Arguments:
-            inputs: (num_triplets, in_channels, hidden_size)
-        Return:
-            output: (num_triplets, hidden_size)
-        """
-        num_triplets = inputs.size(0)
-        # (num_triplets, out_channels, embed_size)
-        feature_maps = self._conv1(self._dp(self._bn(inputs)))
-        _ = self._dp1(self._bn1(feature_maps).relu())
-        hidden = self._linear(_.view(num_triplets, -1))
-        # (num_triplets, 1, embed_size)
-        embedding = self._bn2(self._dp2(hidden)).relu()
-        return embedding
-        # (num_triplets, embed_size)
-
-
-class ConvTransE(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        channels: int,
-        kernel_size: int,
-        dropout: float,
-    ):
-        super().__init__()
-        self._backbone = ConvTransBackbone(
-            hidden_size,
-            in_channels=2,
-            out_channels=channels,
-            kernel_size=kernel_size,
-            dropout=dropout,
-        )
-
-    def forward(
-        self,
-        nodes: torch.Tensor,
-        edges: torch.Tensor,
-        heads: torch.Tensor,
-        relations: torch.Tensor,
-    ):
-        """
-        Arguments:
-            nodes: (num_nodes, hidden_size)
-            edges: (num_edges, hidden_size)
-            heads: (num_triplets,)
-            relations: (num_triplets,)
-        Return:
-
-        """
-        # (num_triplets, hidden_size)
-        head_embedding = nodes[heads]
-        rel_embedding = nodes[relations]
-        # (num_triplets, 2, hidden_size)
-        x = torch.stack([head_embedding, rel_embedding], dim=1)
-        embedding = self._backbone(x)
-        return torch.sigmoid(embedding @ nodes.t())
-
-
-class ConvTransR(nn.Module):
-    def __init__(
-        self, hidden_size: int, channels: int, kernel_size: int, dropout: float
-    ):
-        super().__init__()
-        self._backbone = ConvTransBackbone(
-            hidden_size,
-            in_channels=2,
-            out_channels=channels,
-            kernel_size=kernel_size,
-            dropout=dropout,
-        )
-
-    def forward(
-        self,
-        nodes: torch.Tensor,
-        edges: torch.Tensor,
-        heads: torch.Tensor,
-        tails: torch.Tensor,
-    ):
-        """
-        Arguments:
-            nodes: (num_nodes, embed_size)
-            edges: (num_edges, embed_size)
-            heads: (num_triplets,)
-            tail: (num_triplets,)
-        """
-        # (num_triplets, embed_size)
-        head_embedding = nodes[heads]
-        tail_embedding = nodes[tails]
-        # (num_triplets, 2, embed_size)
-        x = torch.stack([head_embedding, tail_embedding], dim=1)
-        embedding = self._backbone(x)
-        return torch.sigmoid(embedding @ edges.t())
+        return {"ent_logit": ent_logit, "rel_logit": rel_logit}

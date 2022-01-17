@@ -1,3 +1,4 @@
-from .regcn import REGCN, RecurrentRGCN, RecurrentRGCNForLinkPrediction
+from .regcn import REGCN
+from .tevo import Tconv
 
-__all__ = ["RecurrentRGCN", "RecurrentRGCNForLinkPrediction", "REGCN"]
+__all__ = ["REGCN", "Tconv"]

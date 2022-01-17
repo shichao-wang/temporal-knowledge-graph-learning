@@ -4,170 +4,163 @@ import operator
 import os
 import re
 from collections import defaultdict
-from typing import Counter, Dict, Hashable, List, Tuple
+from typing import Counter, Dict, Hashable, Iterable, List, Tuple, TypedDict
 
 import dgl
 import py_helpers
 import torch
+import torch_helpers as th
 from dgl.udf import EdgeBatch
-from torch_helpers import Vocab, vocab
-from torch_helpers.datasets import Batch, Dataset
 
 
 @dataclasses.dataclass()
 class Quadruple:
-    head: Hashable
+    subj: Hashable
     rel: Hashable
-    tail: Hashable
+    obj: Hashable
     time: Hashable
 
 
-@dataclasses.dataclass()
-class QuadrupleBatchInput(Batch):
+class QuadrupleBatchInput(TypedDict):
     snapshots: List[dgl.DGLGraph]
     quadruples: List[Quadruple]
-    head: torch.Tensor
+    time: torch.Tensor
+    subj: torch.Tensor
     rel: torch.Tensor
-    tail: torch.Tensor
+    obj: torch.Tensor
     future_id: int
 
-    def to(self, device: str):
-        self.snapshots = [snap.to(device) for snap in self.snapshots]
-        super().to(device)
-        return self
+
+def groupby_temporal(quadruples: List[Quadruple]) -> Dict[str, List[Quadruple]]:
+    time_getter = operator.attrgetter("time")
+    ordered_quads = sorted(quadruples, key=time_getter)
+    ret = {}
+    for time, quads in itertools.groupby(ordered_quads, key=time_getter):
+        ret[time] = list(quads)
+    return ret
 
 
-class QuadrupleLoader:
+def build_knowledge_graph(
+    triplets: List[Quadruple], vocabs: Dict[str, th.tokenizers.LookupTokenizer]
+) -> dgl.DGLGraph:
+    src_ids, dst_ids, rel_ids = [], [], []
+    r2e = defaultdict(set)
+    for trip in triplets:
+        u = vocabs["ent"].to_id(trip.subj)
+        v = vocabs["ent"].to_id(trip.obj)
+        e = vocabs["rel"].to_id(trip.rel)
+        src_ids.append(u)
+        dst_ids.append(v)
+        rel_ids.append(e)
+        r2e[e].update([u, v])
+
+    node_ids = vocabs["ent"].to_id(vocabs["ent"].get_vocab())
+
+    graph = dgl.graph([])
+
+    rel_node_ids = []
+    rel_len = []
+    for rel_id in range(vocabs["rel"].vocab_size):
+        rel_node_ids.extend(r2e[rel_id])
+        rel_len.append(len(r2e[rel_id]))
+    graph.rel_node_ids = rel_node_ids
+    graph.rel_len = rel_len
+
+    graph.add_nodes(len(node_ids), data={"ent_id": torch.as_tensor(node_ids)})
+    graph.add_edges(
+        src_ids,
+        dst_ids,
+        data={
+            "rel_id": torch.as_tensor(rel_ids),
+        },
+    )
+
+    in_deg = graph.in_degrees()
+    in_deg[torch.nonzero(in_deg == 0).view(-1)] = 1
+    degree_norm = torch.div(1.0, in_deg)
+    graph.ndata["norm"] = degree_norm.view(-1, 1)
+
+    def edge_norm(edges: EdgeBatch):
+        return {"norm": edges.src["norm"] * edges.dst["norm"]}
+
+    graph.apply_edges(edge_norm)
+
+    return graph
+
+
+class ExtrapolateTKGDataset(th.datasets.IterableDataset[QuadrupleBatchInput]):
     def __init__(
-        self, vocabs: Dict[str, Vocab], hist_len: int, bidirectional: bool
+        self,
+        quadruples: Iterable[Quadruple],
+        vocabs: Dict[str, th.tokenizers.LookupTokenizer],
+        hist_len: int,
     ) -> None:
+        super().__init__()
+        self._temporal_quads = groupby_temporal(quadruples)
         self._vocabs = vocabs
         self._hist_len = hist_len
-        self._bidirectional = bidirectional
-
-    def load(self, quadruple_file: str) -> Dataset:
-        quadruples = load_quadruples(quadruple_file, self._bidirectional)
-        temporal_quads = self.groupby_temporal(quadruples)
-        timestamps = sorted(temporal_quads.keys(), key=int)
-        snapshots = [
-            self.build_graph(temporal_quads[time]) for time in timestamps
+        self._timestamps = sorted(self._temporal_quads, key=int)
+        self._snapshots = [
+            build_knowledge_graph(self._temporal_quads[time], self._vocabs)
+            for time in self._timestamps
         ]
 
-        def batch(future: int):
-            hist_snaps = snapshots[max(future - self._hist_len, 0) : future]
-            quadruples = temporal_quads[timestamps[future]]
-
-            heads = [quad.head for quad in quadruples]
+    def __iter__(self):
+        for future in range(1, len(self._snapshots)):
+            hist_snaps = self._snapshots[
+                max(future - self._hist_len, 0) : future
+            ]
+            quadruples = self._temporal_quads[self._timestamps[future]]
+            subjs = [quad.subj for quad in quadruples]
             rels = [quad.rel for quad in quadruples]
-            tails = [quad.tail for quad in quadruples]
+            objs = [quad.obj for quad in quadruples]
+            times = [quad.time for quad in quadruples]
 
-            return QuadrupleBatchInput(
+            batch = QuadrupleBatchInput(
                 snapshots=hist_snaps,
                 quadruples=quadruples,
-                head=torch.as_tensor(
-                    self._vocabs["entity"].convert_tokens_to_ids(heads)
-                ),
-                rel=torch.as_tensor(
-                    self._vocabs["relation"].convert_tokens_to_ids(rels)
-                ),
-                tail=torch.as_tensor(
-                    self._vocabs["entity"].convert_tokens_to_ids(tails)
-                ),
+                subj=self._vocabs["ent"](subjs),
+                rel=self._vocabs["rel"](rels),
+                obj=self._vocabs["ent"](objs),
+                time=times,
                 future_id=future,
             )
+            yield th.datasets.Batch(batch)
 
-        dataset = Dataset([batch(i) for i in range(1, len(snapshots))])
-        return dataset
-
-    def groupby_temporal(
-        self, quadruples: List[Quadruple]
-    ) -> Dict[str, List[Quadruple]]:
-        time_getter = operator.attrgetter("time")
-        ordered_quads = sorted(quadruples, key=time_getter)
-        ret = {}
-        for time, quads in itertools.groupby(ordered_quads, key=time_getter):
-            ret[time] = list(quads)
-        return ret
-
-    def build_graph(self, triplets: List[Quadruple]) -> dgl.DGLGraph:
-        src_ids, dst_ids, rel_ids = [], [], []
-        r2e = defaultdict(set)
-        for trip in triplets:
-            u = self._vocabs["entity"].convert_token_to_id(trip.head)
-            v = self._vocabs["entity"].convert_token_to_id(trip.tail)
-            e = self._vocabs["relation"].convert_token_to_id(trip.rel)
-            src_ids.append(u)
-            dst_ids.append(v)
-            rel_ids.append(e)
-            r2e[e].update([u, v])
-
-        node_ids = self._vocabs["entity"].convert_tokens_to_ids(
-            self._vocabs["entity"]
-        )
-
-        graph = dgl.graph([])
-
-        rel_node_ids = []
-        rel_len = []
-        for rel_id in range(self._vocabs["relation"].max_index):
-            rel_node_ids.extend(r2e[rel_id])
-            rel_len.append(len(r2e[rel_id]))
-        graph.rel_node_ids = rel_node_ids
-        graph.rel_len = rel_len
-
-        graph.add_nodes(
-            len(node_ids),
-            data={"ent_id": torch.as_tensor(node_ids)},
-        )
-        graph.add_edges(
-            src_ids,
-            dst_ids,
-            data={
-                "rel_id": torch.as_tensor(rel_ids),
-            },
-        )
-
-        in_deg = graph.in_degrees()
-        in_deg[torch.nonzero(in_deg == 0).view(-1)] = 1
-        degree_norm = torch.div(1.0, in_deg)
-        graph.ndata["norm"] = degree_norm.view(-1, 1)
-
-        def edge_norm(edges: EdgeBatch):
-            return {"norm": edges.src["norm"] * edges.dst["norm"]}
-
-        graph.apply_edges(edge_norm)
-
-        return graph
+    def __len__(self):
+        return len(self._snapshots) - 1
 
 
-def build_vocabs(quadruple_file: str, bidirectional: str) -> Dict[str, Vocab]:
+def build_vocabs(
+    quadruple_file: str, bidirectional: str
+) -> Dict[str, th.tokenizers.LookupTokenizer]:
     quadruples = load_quadruples(quadruple_file, bidirectional)
     return build_vocab_from_quadruples(quadruples)
 
 
 QUAD_RE = re.compile(
-    r"^(?P<head>\d+)\s+(?P<rel>\d+)\s+(?P<tail>\d+)\s+(?P<time>\d+)"
+    r"^(?P<subj>\d+)\s+(?P<rel>\d+)\s+(?P<obj>\d+)\s+(?P<time>\d+)"
 )
 
 
 def load_quadruples(
     quadruple_file: str, bidirectional: bool
-) -> Dict[str, Vocab]:
+) -> List[Quadruple]:
     quadruples: List[Quadruple] = []
     with py_helpers.auto_open(quadruple_file) as fp:
         for line in fp:
             match = QUAD_RE.search(line)
-            head, tail, rel, time = match.group("head", "tail", "rel", "time")
-            quadruples.append(Quadruple(head, rel, tail, time))
+            subj, rel, obj, time = match.group("subj", "rel", "obj", "time")
+            quadruples.append(Quadruple(subj, rel, obj, time))
 
     if bidirectional:
         reversed_quads = []
         for quad in quadruples:
             reversed_quads.append(
                 Quadruple(
-                    head=quad.tail,
-                    rel="reverse" + quad.rel,
-                    tail=quad.head,
+                    subj=quad.obj,
+                    rel="REVERSE # " + quad.rel,
+                    obj=quad.subj,
                     time=quad.time,
                 )
             )
@@ -178,24 +171,21 @@ def load_quadruples(
 
 def build_vocab_from_quadruples(
     quadruples: List[Quadruple],
-) -> Dict[str, Vocab]:
+) -> Dict[str, th.tokenizers.LookupTokenizer]:
     field_values_dict = {
         field.name: [getattr(quad, field.name) for quad in quadruples]
         for field in dataclasses.fields(Quadruple)
     }
 
     def counter_vocab(counter: Counter):
-        return vocab.build_from_counter(
-            counter,
-            special_tokens={"[UNK]": 1, "[PAD]": 0},
-            identified_tokens={"pad": "[PAD]", "unk": "[UNK]"},
+        return th.tokenizers.CounterLookupTokenizer(
+            counter, pad_tok="[PAD]", unk_tok="[UNK]"
         )
 
     counters = {
-        "entity": Counter(
-            field_values_dict["head"] + field_values_dict["tail"]
-        ),
-        "relation": Counter(field_values_dict["rel"]),
+        "ent": Counter(field_values_dict["subj"] + field_values_dict["obj"]),
+        "rel": Counter(field_values_dict["rel"]),
+        "time": Counter(field_values_dict["time"]),
     }
     vocabs = {key: counter_vocab(ctr) for key, ctr in counters.items()}
     # There should not have a vocab for time field.
@@ -209,11 +199,14 @@ def load_tkg_dataset(
     data_folder: str,
     hist_len: int,
     bidirectional: bool,
-) -> Tuple[Dict[str, Dataset], Dict[str, Vocab]]:
+) -> Tuple[
+    Dict[str, ExtrapolateTKGDataset], Dict[str, th.tokenizers.LookupTokenizer]
+]:
     vocabs = build_vocabs(os.path.join(data_folder, "train.txt"), bidirectional)
-    loader = QuadrupleLoader(vocabs, hist_len, bidirectional)
-    datasets = {
-        s: loader.load(os.path.join(data_folder, f"{s}.txt"))
-        for s in ["train", "val", "test"]
-    }
+    datasets = {}
+    for subset in ["train", "val", "test"]:
+        data_file = os.path.join(data_folder, f"{subset}.txt")
+        quadruples = load_quadruples(data_file, bidirectional)
+        dataset = ExtrapolateTKGDataset(quadruples, vocabs, hist_len)
+        datasets[subset] = dataset
     return datasets, vocabs

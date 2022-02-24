@@ -1,66 +1,103 @@
-import dataclasses
+import copy
 import itertools
-import operator
+import logging
 import os
 import re
 from collections import defaultdict
-from typing import Counter, Dict, Hashable, Iterable, List, Tuple, TypedDict
+from typing import Counter, Dict, Hashable, List, Optional, Tuple, TypedDict
 
 import dgl
-import py_helpers
 import torch
-import torch_helpers as th
 from dgl.udf import EdgeBatch
+from tallow.data import datasets, vocabs
+
+logger = logging.getLogger(__name__)
 
 
-@dataclasses.dataclass()
-class Quadruple:
+class Quadruple(TypedDict):
     subj: Hashable
     rel: Hashable
     obj: Hashable
-    time: Hashable
+    mmt: Hashable
 
 
-class QuadrupleBatchInput(TypedDict):
-    snapshots: List[dgl.DGLGraph]
-    quadruples: List[Quadruple]
-    time: torch.Tensor
+class TkgRExample(TypedDict):
+    hist_graphs: List[dgl.DGLGraph]
     subj: torch.Tensor
     rel: torch.Tensor
     obj: torch.Tensor
-    future_id: int
+    quadruples: List[Quadruple]
 
 
-def groupby_temporal(quadruples: List[Quadruple]) -> Dict[str, List[Quadruple]]:
-    time_getter = operator.attrgetter("time")
-    ordered_quads = sorted(quadruples, key=time_getter)
-    ret = {}
-    for time, quads in itertools.groupby(ordered_quads, key=time_getter):
-        ret[time] = list(quads)
+class ExtrapolateTKGDataset(datasets.Dataset[TkgRExample]):
+    def __init__(
+        self,
+        temporal_quads: List[List[Quadruple]],
+        hist_len: Optional[int],
+        vocabs: Dict[str, vocabs.Vocab],
+    ) -> None:
+        super().__init__()
+        self._temporal_quads = temporal_quads
+        self._hist_len = hist_len
+        self._vocabs = vocabs
+
+    def __iter__(self):
+        for future in range(1, len(self._temporal_quads)):
+            xlice = slice(max(future - self._hist_len, 0), future)
+            hist_graphs = [
+                build_knowledge_graph(quads, self._vocabs)
+                for quads in self._temporal_quads[xlice]
+            ]
+            quadruples = self._temporal_quads[future]
+            subjs = [quad["subj"] for quad in quadruples]
+            rels = [quad["rel"] for quad in quadruples]
+            objs = [quad["obj"] for quad in quadruples]
+
+            example = TkgRExample(
+                hist_graphs=hist_graphs,
+                subj=torch.from_numpy(self._vocabs["ent"](subjs)),
+                rel=torch.from_numpy(self._vocabs["rel"](rels)),
+                obj=torch.from_numpy(self._vocabs["ent"](objs)),
+                quadruples=quadruples,
+            )
+            yield datasets.Batch(example)
+
+    def __len__(self):
+        return len(self._temporal_quads) - 1
+
+
+def groupby_temporal(quadruples: List[Quadruple]) -> List[List[Quadruple]]:
+    mmt_getter = lambda quad: int(quad["mmt"])
+    consecutive_quads = sorted(quadruples, key=mmt_getter)
+    ret = []
+    for _, quads in itertools.groupby(consecutive_quads, key=mmt_getter):
+        quads = list(quads)
+        if quads:
+            ret.append(quads)
     return ret
 
 
 def build_knowledge_graph(
-    triplets: List[Quadruple], vocabs: Dict[str, th.tokenizers.LookupTokenizer]
+    triplets: List[Quadruple], vocabs: Dict[str, vocabs.Vocab]
 ) -> dgl.DGLGraph:
     src_ids, dst_ids, rel_ids = [], [], []
     r2e = defaultdict(set)
     for trip in triplets:
-        u = vocabs["ent"].to_id(trip.subj)
-        v = vocabs["ent"].to_id(trip.obj)
-        e = vocabs["rel"].to_id(trip.rel)
+        u = vocabs["ent"].to_id(trip["subj"])
+        v = vocabs["ent"].to_id(trip["obj"])
+        e = vocabs["rel"].to_id(trip["rel"])
         src_ids.append(u)
         dst_ids.append(v)
         rel_ids.append(e)
         r2e[e].update([u, v])
 
-    node_ids = vocabs["ent"].to_id(vocabs["ent"].get_vocab())
+    node_ids = vocabs["ent"].to_id(vocabs["ent"])
 
     graph = dgl.graph([])
 
     rel_node_ids = []
     rel_len = []
-    for rel_id in range(vocabs["rel"].vocab_size):
+    for rel_id in range(len(vocabs["rel"])):
         rel_node_ids.extend(r2e[rel_id])
         rel_len.append(len(r2e[rel_id]))
     graph.rel_node_ids = rel_node_ids
@@ -75,6 +112,7 @@ def build_knowledge_graph(
         },
     )
 
+    # external precompute value
     in_deg = graph.in_degrees()
     in_deg[torch.nonzero(in_deg == 0).view(-1)] = 1
     degree_norm = torch.div(1.0, in_deg)
@@ -88,56 +126,6 @@ def build_knowledge_graph(
     return graph
 
 
-class ExtrapolateTKGDataset(th.datasets.IterableDataset[QuadrupleBatchInput]):
-    def __init__(
-        self,
-        quadruples: Iterable[Quadruple],
-        vocabs: Dict[str, th.tokenizers.LookupTokenizer],
-        hist_len: int,
-    ) -> None:
-        super().__init__()
-        self._temporal_quads = groupby_temporal(quadruples)
-        self._vocabs = vocabs
-        self._hist_len = hist_len
-        self._timestamps = sorted(self._temporal_quads, key=int)
-        self._snapshots = [
-            build_knowledge_graph(self._temporal_quads[time], self._vocabs)
-            for time in self._timestamps
-        ]
-
-    def __iter__(self):
-        for future in range(1, len(self._snapshots)):
-            hist_snaps = self._snapshots[
-                max(future - self._hist_len, 0) : future
-            ]
-            quadruples = self._temporal_quads[self._timestamps[future]]
-            subjs = [quad.subj for quad in quadruples]
-            rels = [quad.rel for quad in quadruples]
-            objs = [quad.obj for quad in quadruples]
-            times = [quad.time for quad in quadruples]
-
-            batch = QuadrupleBatchInput(
-                snapshots=hist_snaps,
-                quadruples=quadruples,
-                subj=self._vocabs["ent"](subjs),
-                rel=self._vocabs["rel"](rels),
-                obj=self._vocabs["ent"](objs),
-                time=times,
-                future_id=future,
-            )
-            yield th.datasets.Batch(batch)
-
-    def __len__(self):
-        return len(self._snapshots) - 1
-
-
-def build_vocabs(
-    quadruple_file: str, bidirectional: str
-) -> Dict[str, th.tokenizers.LookupTokenizer]:
-    quadruples = load_quadruples(quadruple_file, bidirectional)
-    return build_vocab_from_quadruples(quadruples)
-
-
 QUAD_RE = re.compile(
     r"^(?P<subj>\d+)\s+(?P<rel>\d+)\s+(?P<obj>\d+)\s+(?P<time>\d+)"
 )
@@ -147,66 +135,70 @@ def load_quadruples(
     quadruple_file: str, bidirectional: bool
 ) -> List[Quadruple]:
     quadruples: List[Quadruple] = []
-    with py_helpers.auto_open(quadruple_file) as fp:
+    with open(quadruple_file) as fp:
         for line in fp:
             match = QUAD_RE.search(line)
             subj, rel, obj, time = match.group("subj", "rel", "obj", "time")
-            quadruples.append(Quadruple(subj, rel, obj, time))
+            quadruples.append(Quadruple(subj=subj, rel=rel, obj=obj, mmt=time))
 
     if bidirectional:
         reversed_quads = []
         for quad in quadruples:
-            reversed_quads.append(
-                Quadruple(
-                    subj=quad.obj,
-                    rel="REVERSE # " + quad.rel,
-                    obj=quad.subj,
-                    time=quad.time,
-                )
+            rev_quad = Quadruple(
+                subj=quad["obj"],
+                rel="REVERSE # " + quad["rel"],
+                obj=quad["subj"],
+                mmt=quad["mmt"],
             )
-        quadruples = quadruples + reversed_quads
+            reversed_quads.append(rev_quad)
+        quadruples += reversed_quads
 
     return quadruples
 
 
 def build_vocab_from_quadruples(
     quadruples: List[Quadruple],
-) -> Dict[str, th.tokenizers.LookupTokenizer]:
-    field_values_dict = {
-        field.name: [getattr(quad, field.name) for quad in quadruples]
-        for field in dataclasses.fields(Quadruple)
-    }
+) -> Dict[str, vocabs.Vocab]:
+    ents = Counter()
+    rels = Counter()
+    for quad in quadruples:
+        ents.update([quad["subj"], quad["obj"]])
+        rels.update([quad["rel"]])
 
-    def counter_vocab(counter: Counter):
-        return th.tokenizers.CounterLookupTokenizer(
-            counter, pad_tok="[PAD]", unk_tok="[UNK]"
-        )
-
-    counters = {
-        "ent": Counter(field_values_dict["subj"] + field_values_dict["obj"]),
-        "rel": Counter(field_values_dict["rel"]),
-        "time": Counter(field_values_dict["time"]),
+    presv_toks = {"unk": "[UNK]"}
+    tknzs = {
+        "ent": vocabs.counter_vocab(ents, presv_toks),
+        "rel": vocabs.counter_vocab(rels, presv_toks),
     }
-    vocabs = {key: counter_vocab(ctr) for key, ctr in counters.items()}
     # There should not have a vocab for time field.
     # Times in val and test are unknown for training apparently.
     # sorted_times = sorted(set(field_values_dict["time"]), key=int)
     # vocabs["time"] = vocab.build_from_sequence(sorted_times)
-    return vocabs
+    return tknzs
 
 
 def load_tkg_dataset(
     data_folder: str,
     hist_len: int,
     bidirectional: bool,
-) -> Tuple[
-    Dict[str, ExtrapolateTKGDataset], Dict[str, th.tokenizers.LookupTokenizer]
-]:
-    vocabs = build_vocabs(os.path.join(data_folder, "train.txt"), bidirectional)
-    datasets = {}
-    for subset in ["train", "val", "test"]:
+    different_unknowns: bool,
+) -> Tuple[Dict[str, ExtrapolateTKGDataset], Dict[str, vocabs.Vocab]]:
+    subsets = ("train", "val", "test")
+    quadruples: Dict[str, List[Quadruple]] = {}
+    for subset in subsets:
         data_file = os.path.join(data_folder, f"{subset}.txt")
-        quadruples = load_quadruples(data_file, bidirectional)
-        dataset = ExtrapolateTKGDataset(quadruples, vocabs, hist_len)
+        quadruples[subset] = load_quadruples(data_file, bidirectional)
+        num_edges = len(quadruples[subset])
+        logger.info(f"# {subset} Edges {num_edges}")
+
+    vocab_quads = copy.deepcopy(quadruples["train"])
+    if different_unknowns:
+        vocab_quads.extend(quadruples["val"])
+        vocab_quads.extend(quadruples["test"])
+    vocabs = build_vocab_from_quadruples(vocab_quads)
+    datasets = {}
+    for subset in subsets:
+        temporal_quads = groupby_temporal(quadruples[subset])
+        dataset = ExtrapolateTKGDataset(temporal_quads, hist_len, vocabs)
         datasets[subset] = dataset
     return datasets, vocabs

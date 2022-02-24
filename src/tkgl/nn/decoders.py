@@ -73,8 +73,8 @@ class ConvTransE(nn.Module):
         self,
         nodes: torch.Tensor,
         edges: torch.Tensor,
-        heads: torch.Tensor,
-        relations: torch.Tensor,
+        subjs: torch.Tensor,
+        rels: torch.Tensor,
     ):
         """
         Arguments:
@@ -86,12 +86,12 @@ class ConvTransE(nn.Module):
 
         """
         # (num_triplets, hidden_size)
-        head_embedding = nodes[heads]
-        rel_embedding = nodes[relations]
+        subj_embeds = nodes[subjs]
+        rel_embeds = edges[rels]
         # (num_triplets, 2, hidden_size)
-        x = torch.stack([head_embedding, rel_embedding], dim=1)
-        embedding = self._backbone(x)
-        return torch.sigmoid(embedding @ nodes.t())
+        x = torch.stack([subj_embeds, rel_embeds], dim=1)
+        embeds = self._backbone(x)
+        return embeds @ nodes.t()
 
 
 class ConvTransR(nn.Module):
@@ -111,8 +111,8 @@ class ConvTransR(nn.Module):
         self,
         nodes: torch.Tensor,
         edges: torch.Tensor,
-        heads: torch.Tensor,
-        tails: torch.Tensor,
+        subjs: torch.Tensor,
+        objs: torch.Tensor,
     ):
         """
         Arguments:
@@ -122,9 +122,9 @@ class ConvTransR(nn.Module):
             tail: (num_triplets,)
         """
         # (num_triplets, embed_size)
-        head_embedding = nodes[heads]
-        tail_embedding = nodes[tails]
+        subj_embeds = nodes[subjs]
+        obj_embeds = nodes[objs]
         # (num_triplets, 2, embed_size)
-        x = torch.stack([head_embedding, tail_embedding], dim=1)
-        embedding = self._backbone(x)
-        return torch.sigmoid(embedding @ edges.t())
+        x = torch.stack([subj_embeds, obj_embeds], dim=1)
+        embeds = self._backbone(x)
+        return embeds @ edges.t()

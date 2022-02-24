@@ -1,11 +1,10 @@
 from typing import List, Tuple
 
 import dgl
+import tallow as tl
 import torch
-import torch_helpers as th
 from dgl.udf import EdgeBatch, NodeBatch
 from torch import nn
-from torch.nn import functional as tf
 
 import tkgl
 
@@ -48,14 +47,14 @@ class RGCN(nn.Module):
 
         def __init__(self, input_size: int, hidden_size: int):
             super().__init__()
-            self._rel_linear = nn.Linear(input_size, hidden_size, bias=False)
-            self._loop_linear = nn.Linear(input_size, hidden_size, bias=False)
+            self._r_linear = nn.Linear(input_size, hidden_size, bias=False)
+            self._sl_linear = nn.Linear(input_size, hidden_size, bias=False)
+            self._el_linear = nn.Linear(input_size, hidden_size, bias=False)
             self._rrelu = nn.RReLU()
 
         def forward(
             self,
             graph: dgl.DGLHeteroGraph,
-            features: Tuple[torch.Tensor, torch.Tensor] = None,
         ) -> torch.Tensor:
             """
             Arguments:
@@ -66,29 +65,31 @@ class RGCN(nn.Module):
             Return:
                 output: (num_nodes, hidden_size)
             """
-            if features:
-                nodes, edges = features
-                graph.srcdata["h"] = nodes
-                graph.edata["h"] = edges
 
-            self_msg = self._loop_linear(graph.ndata["h"])
+            def message_fn(edges: EdgeBatch):
+                rel = edges.data["h"]
+                ent = edges.src["h"]
 
-            graph.update_all(
-                self.message_fn, dgl.function.sum("msg", "h"), self.apply_fn
+                msg = self._r_linear(rel + ent)
+
+                return {"msg": msg}
+
+            def apply_fn(nodes: NodeBatch):
+                h = nodes.data["h"] * nodes.data["norm"]
+                h = self._rrelu(h + self_msg)
+                return {"h": h}
+
+            self_msg = self._sl_linear(graph.ndata["h"])
+            isolate_nodes = torch.masked_select(
+                torch.arange(0, graph.number_of_nodes()),
+                (graph.in_degrees() == 0),
             )
-            nodes = graph.ndata["h"] + self_msg
-            return self._rrelu(nodes)
-
-        def message_fn(self, edges: EdgeBatch):
-            rel = edges.data["h"]
-            ent = edges.src["h"]
-
-            msg = self._rel_linear(rel + ent)
-
-            return {"msg": msg}
-
-        def apply_fn(self, nodes: NodeBatch):
-            return {"h": nodes.data["h"] * nodes.data["norm"]}
+            iso_msg = self._el_linear(graph.ndata["h"])
+            self_msg[isolate_nodes] = iso_msg[isolate_nodes]
+            graph.update_all(message_fn, dgl.function.sum("msg", "h"), apply_fn)
+            # nodes = graph.ndata["h"] + self_msg
+            # return self._rrelu(nodes)
+            return graph.ndata["h"]
 
 
 class EvolutionUnit(nn.Module):
@@ -122,19 +123,20 @@ class EvolutionUnit(nn.Module):
 
         """
         # relaltion evolution
-        rel_ent_embed = torch.zeros_like(rel_hidden)
-        rel_ent_embeds = torch.split_with_sizes(
-            ent_hidden[graph.rel_node_ids], graph.rel_len
-        )
-        for rel, ent_embeds in enumerate(rel_ent_embeds):
-            if ent_embeds.size(0) != 0:
-                rel_ent_embed[rel] = torch.mean(ent_embeds, dim=0)
+        rel_ent_embed = rel_embed
+        # rel_ent_embed = torch.zeros_like(rel_embed)
+        # rel_ent_embeds = torch.split_with_sizes(
+        #     ent_hidden[graph.rel_node_ids], graph.rel_len
+        # )
+        # for rel, ent_embeds in enumerate(rel_ent_embeds):
+        #     if ent_embeds.size(0) != 0:
+        #         rel_ent_embed[rel] = torch.mean(ent_embeds, dim=0)
 
+        # rel evolution
         r_rel_embed = torch.cat([rel_embed, rel_ent_embed], dim=-1)
-        n_rel_embed = tf.normalize(self._gru(r_rel_embed, rel_hidden))
+        n_rel_embed = self._gru(r_rel_embed, rel_hidden)
         # entity evolution
         w_ent_embed = self._rgcn(graph, ent_hidden, n_rel_embed)
-        w_ent_embed = tf.normalize(w_ent_embed)
         u = torch.sigmoid(self._linear(ent_hidden))
         n_ent_embed = ent_hidden + u * (w_ent_embed - ent_hidden)
 
@@ -153,14 +155,10 @@ class REGCN(nn.Module):
         dropout: float,
     ):
         super().__init__()
-        ent_weight = th.nn.random_init_embedding_weight(
-            num_entities, hidden_size
-        )
-        rel_weight = th.nn.random_init_embedding_weight(
-            num_relations, hidden_size
-        )
-        self._ent_embeds = nn.Parameter(ent_weight)
-        self._rel_embeds = nn.Parameter(rel_weight)
+        self._ent_embeds = nn.Parameter(torch.zeros(num_entities, hidden_size))
+        self._rel_embeds = nn.Parameter(torch.zeros(num_relations, hidden_size))
+        nn.init.normal_(self._ent_embeds)
+        nn.init.xavier_uniform_(self._rel_embeds)
 
         self._evolution = EvolutionUnit(hidden_size, hidden_size, num_layers)
 
@@ -179,7 +177,7 @@ class REGCN(nn.Module):
 
     def forward(
         self,
-        snapshots: List[dgl.DGLGraph],
+        hist_graphs: List[dgl.DGLGraph],
         subj: torch.Tensor,
         rel: torch.Tensor,
         obj: torch.Tensor,
@@ -195,11 +193,11 @@ class REGCN(nn.Module):
         """
         ent_embeds = self._ent_embeds
         rel_embeds = self._rel_embeds
-        for graph in snapshots:
+        for graph in hist_graphs:
             ent_embeds, rel_embeds = self._evolution(
                 graph, ent_embeds, rel_embeds, self._rel_embeds
             )
         rel_logit = self._rel_decoder(ent_embeds, rel_embeds, subj, obj)
-        ent_logit = self._ent_decoder(ent_embeds, rel_embeds, subj, rel)
+        obj_logit = self._ent_decoder(ent_embeds, rel_embeds, subj, rel)
 
-        return {"ent_logit": ent_logit, "rel_logit": rel_logit}
+        return {"obj_logit": obj_logit, "rel_logit": rel_logit}

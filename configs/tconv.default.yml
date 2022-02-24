@@ -1,0 +1,20 @@
+data:
+  data_folder: "/home/wangshichao/workspace/temporal-knowledge-graph-learning/datasets"
+  dataset: null 
+  hist_len: &hl 3 
+  bidirectional: true
+  different_unknowns: true
+
+model:
+  arch: tconv
+  hidden_size: 200
+  hist_len: *hl
+  num_kernels: 5
+  num_layers: 2
+  kernel_size: 3
+  channels: 50
+  dropout: 0.2
+
+save_folder_path: null
+patient: 5
+lr: 1.0e-3

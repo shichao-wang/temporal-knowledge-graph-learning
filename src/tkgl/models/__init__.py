@@ -1,4 +1,6 @@
+from . import criterions
+from .refine import Refine
 from .regcn import REGCN
-from .tevo import Tconv
+from .tconv import Tconv
 
-__all__ = ["REGCN", "Tconv"]
+__all__ = ["REGCN", "Tconv", "criterions", "Refine"]

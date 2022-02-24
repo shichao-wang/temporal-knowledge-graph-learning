@@ -1,99 +1,151 @@
-import dataclasses
-import pprint
+import logging
+import os
+from typing import Dict
 
-import py_helpers
 import torch
-import torch_helpers as th
-from torch import optim
-from torch_helpers.engine import callbacks
+from molurus import config_dict
+from tallow import evaluators, trainers
+from tallow.data import vocabs
+from torch import nn, optim
 
 import tkgl
+from tkgl.metrics import EntMRR, JointMetric
+
+logger = logging.getLogger(__name__)
 
 
-@dataclasses.dataclass()
-class Args:
-    data_folder: str
+def validate_module_parameters(m1: nn.Module, m2: nn.Module):
+    for p1, p2 in zip(m1.parameters(), m2.parameters()):
+        p1 = p1.cpu()
+        p2 = p2.cpu()
+        if not torch.allclose(p1, p2):
+            logger.info(f"Tensor mismatch: {p1} vs {p2}")
 
-    model: str
-    save_model: bool = False
 
-    seed: int = 0
-    hist_len: int = 6
+def validate_state_dicts(m1: Dict, m2: Dict):
+    if len(m1) != len(m2):
+        logger.info(f"Length mismatch: {len(m1)}, {len(m2)}")
+        return False
 
-    hidden_size: int = 200
-    num_kernels: int = 2
-    num_layers: int = 2
-    kernel_size: int = 3
-    channels: int = 50
-    dropout: float = 0.2
+    # Replicate modules have "module" attached to their keys, so strip these off when comparing to local model.
+    if next(iter(m1.keys())).startswith("module"):
+        m1 = {k[len("module") + 1 :]: v for k, v in m1.items()}
 
-    lr: float = 1e-3
-    num_epochs: int = 10
+    if next(iter(m2.keys())).startswith("module"):
+        m2 = {k[len("module") + 1 :]: v for k, v in m2.items()}
+
+    for ((k_1, v_1), (k_2, v_2)) in zip(m1.items(), m2.items()):
+        if k_1 != k_2:
+            logger.info(f"Key mismatch: {k_1} vs {k_2}")
+            return False
+        # convert both to the same CUDA device
+        if str(v_1.device) != "cuda:0":
+            v_1 = v_1.to("cuda:0" if torch.cuda.is_available() else "cpu")
+        if str(v_2.device) != "cuda:0":
+            v_2 = v_2.to("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        if not torch.allclose(v_1, v_2):
+            logger.info(f"Tensor mismatch: {v_1} vs {v_2}")
+            # return False
+
+
+def build_model(cfg, tknzs: Dict[str, vocabs.Vocab]):
+    if cfg["arch"] == "regcn":
+        model = tkgl.models.REGCN(
+            len(tknzs["ent"]),
+            len(tknzs["rel"]),
+            hidden_size=cfg["hidden_size"],
+            num_layers=cfg["num_layers"],
+            kernel_size=cfg["kernel_size"],
+            channels=cfg["channels"],
+            dropout=cfg["dropout"],
+        )
+        criterion = tkgl.models.criterions.JointLoss()
+    elif cfg["arch"] == "tconv":
+        model = tkgl.models.Tconv(
+            len(tknzs["ent"]),
+            len(tknzs["rel"]),
+            hist_len=cfg["hist_len"],
+            hidden_size=cfg["hidden_size"],
+            num_kernels=cfg["num_kernels"],
+            num_layers=cfg["num_layers"],
+            kernel_size=cfg["kernel_size"],
+            channels=cfg["channels"],
+            dropout=cfg["dropout"],
+        )
+        criterion = tkgl.models.criterions.JointLoss()
+    elif cfg["arch"] == "refine":
+        model = tkgl.models.Refine(
+            len(tknzs["ent"]),
+            len(tknzs["rel"]),
+            hidden_size=cfg["hidden_size"],
+            num_layers=cfg["num_layers"],
+            channels=cfg["channels"],
+            kernel_size=cfg["kernel_size"],
+            dropout=cfg["dropout"],
+        )
+        criterion = tkgl.models.criterions.RefineLoss()
+    else:
+        raise ValueError()
+    logger.info(f"Model: {model.__class__.__name__}")
+    logger.info(f"Criterion: {criterion.__class__.__name__}")
+    return model, criterion
+
+
+def load_tkg_data(cfg):
+    datasets, vocabs = tkgl.datasets.load_tkg_dataset(
+        os.path.join(cfg["data_folder"], cfg["dataset"]),
+        cfg["hist_len"],
+        bidirectional=cfg["bidirectional"],
+        different_unknowns=cfg["different_unknowns"],
+    )
+    return datasets, vocabs
 
 
 def main():
-    args = py_helpers.dataclass_parser.parse(Args)
-    pprint.pprint(dataclasses.asdict(args))
-    th.seed_all(args.seed)
-    datasets, vocabs = tkgl.datasets.load_tkg_dataset(
-        args.data_folder, args.hist_len, bidirectional=True
-    )
-    print(f"# entities {vocabs['ent'].vocab_size}")
-    print(f"# relations {vocabs['rel'].vocab_size}")
+    cfg = config_dict.parse()
+    assert "save_folder_path" in cfg
+    os.makedirs(cfg["save_folder_path"], exist_ok=True)
+    with open(os.path.join(cfg["save_folder_path"], "config.yml"), "w") as fp:
+        config_dict.dump(cfg, fp)
+    datasets, vocabs = load_tkg_data(cfg["data"])
 
-    if args.model == "tconv":
-        model = tkgl.models.Tconv(
-            vocabs["ent"].vocab_size,
-            vocabs["rel"].vocab_size,
-            hist_len=args.hist_len,
-            hidden_size=args.hidden_size,
-            num_kernels=args.num_kernels,
-            num_layers=args.num_layers,
-            kernel_size=args.kernel_size,
-            channels=args.channels,
-            dropout=args.dropout,
-        )
-    elif args.model == "regcn":
-        model = tkgl.models.REGCN(
-            vocabs["ent"].vocab_size,
-            vocabs["rel"].vocab_size,
-            hidden_size=args.hidden_size,
-            num_layers=args.num_layers,
-            kernel_size=args.kernel_size,
-            channels=args.channels,
-            dropout=args.dropout,
-        )
-    else:
-        raise ValueError()
-    metric = tkgl.metrics.JointMetric()
-    engine = th.NativeEngine(model, "cuda")
-    model_save = callbacks.ModelSave(
-        save_folder_path=f"./saved_models/{args.model}",
-        model_template="epoch-{epoch}_mrr-{val[e_mrr]:.6f}-{test[e_mrr]:.6f}-{test[r_mrr]:.6f}.pt",
-        metric_value="+{val[e_mrr]}",
-        n=3,
-    )
-    training_callbacks = []
-    if args.save_model:
-        training_callbacks.append(model_save)
+    num_entities = len(vocabs["ent"])
+    print(f"# entities {num_entities}")
+    num_relations = len(vocabs["rel"])
+    print(f"# relations {num_relations}")
+    num_edges = datasets["train"]
+    print(f"# edges {num_edges}")
 
-    train_data = datasets.pop("train").shuffle()
-    history = engine.train(
-        train_data,
-        criterion=tkgl.nn.JointLoss(),
-        optimizer=optim.Adam(model.parameters(), lr=args.lr),
-        num_steps=len(train_data) * args.num_epochs,
-        metric=metric,
-        val_data=datasets,
-        callback_list=training_callbacks,
-    )
+    model, criterion = build_model(cfg["model"], vocabs)
 
-    if args.save_model:
-        best_model_path = model_save.get_best_model_path()
-        model.load_state_dict(torch.load(best_model_path))
-        test_engine = th.NativeEngine(model, "cuda")
-        metrics = test_engine.test(datasets["test"], metric)
-        pprint.pprint(metrics)
+    def _init_optim(m: nn.Module):
+        return optim.Adam(m.parameters(), lr=cfg["lr"])
+
+    val_metric = tkgl.metrics.EntMRR()
+
+    ckpt = trainers.hooks.CheckpointHook(
+        cfg["save_folder_path"], reload_on_begin=True
+    )
+    earlystop = trainers.hooks.EarlyStopHook(
+        cfg["save_folder_path"], patient=cfg["patient"]
+    )
+    trainer = trainers.SupervisedTrainer(
+        model,
+        criterion=criterion,
+        init_optim=_init_optim,
+        metric=val_metric,
+        _hooks=[ckpt, earlystop],
+    )
+    trainer.execute(datasets["train"], eval_data=datasets["val"])
+
+    metric = JointMetric()
+    evaluator = evaluators.trainer_evaluator(trainer, metric)
+    evaluator.model.load_state_dict(
+        torch.load(earlystop.best_model_path)["model"]
+    )
+    metric_dataframe = evaluator.execute(datasets)
+    print(metric_dataframe)
 
 
 if __name__ == "__main__":

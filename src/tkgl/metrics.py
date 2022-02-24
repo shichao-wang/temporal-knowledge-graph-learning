@@ -1,93 +1,83 @@
-import copy
-import enum
-from typing import DefaultDict, Dict, Hashable, List, Optional
+from typing import DefaultDict, Dict, Hashable, List
 
 import torch
 import torchmetrics
 from torch.nn import functional as tf
-from torchmetrics import functional as tmf
 
 
-class MRR(torchmetrics.MeanMetric):
-    def update(self, logit: torch.Tensor, target: torch.Tensor) -> None:
-        value = tmf.retrieval_reciprocal_rank(logit, target)
-        return super().update(value)
+class RankMetric(torchmetrics.Metric):
+    ranks: torch.Tensor
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.add_state("ranks", torch.tensor([]))
+
+    def update(self, logit: torch.Tensor, target: torch.Tensor):
+        ranks = logit_ranks(logit, target)
+        self.ranks = torch.cat([self.ranks, ranks], dim=-1)
 
 
-class Hit(torchmetrics.MeanMetric):
+def logit_ranks(logit: torch.Tensor, target: torch.Tensor):
+    total_ranks = logit.argsort(dim=-1, descending=True)
+    ranks = torch.nonzero(total_ranks == target.view(-1, 1))[:, 1]
+    return ranks
+
+
+def mrr_value(ranks: torch.Tensor):
+    return (1 / (ranks + 1)).mean(dim=-1)
+
+
+def hit_value(ranks: torch.Tensor, k: int):
+    return (ranks < k).float().mean(dim=-1)
+
+
+class MRR(RankMetric):
+    def compute(self):
+        return mrr_value(self.ranks)
+
+
+class Hit(RankMetric):
     def __init__(self, k: int):
         super().__init__()
-        self._k = k
+        self.k = k
 
-    def update(self, logit: torch.Tensor, target: torch.Tensor) -> None:
-        value = tmf.retrieval_hit_rate(logit, target, k=self._k)
-        return super().update(value)
-
-
-class TKGBaseMetric(torchmetrics.MetricCollection):
-    def __init__(self, mrr: bool = True, hits: bool = False) -> None:
-        metrics = {}
-        if mrr:
-            metrics["mrr"] = MRR()
-        if hits:
-            for k in [1, 3, 10]:
-                metrics["hit@{k}"] = Hit(k)
-        super().__init__(metrics)
+    def compute(self):
+        return hit_value(self.ranks, self.k)
 
 
-class EntMetric(TKGBaseMetric):
-    def update(self, ent_logit: torch.Tensor, subj: torch.Tensor):
-        onehot_target = tf.one_hot(subj, ent_logit.size(-1))
-        return super().update(logit=ent_logit, target=onehot_target)
-
-
-class RelMetric(TKGBaseMetric):
-    def update(self, rel_logit: torch.Tensor, rel: torch.Tensor):
-        onehot_target = tf.one_hot(rel, rel_logit.size(-1))
-        return super().update(logit=rel_logit, target=onehot_target)
+class EntMRR(MRR):
+    def update(self, obj_logit: torch.Tensor, obj: torch.Tensor) -> None:
+        return super().update(logit=obj_logit, target=obj)
 
 
 class JointMetric(torchmetrics.Metric):
-    def __init__(self, mrr: bool = True, hits: bool = False) -> None:
+    ent_ranks: torch.Tensor
+    rel_ranks: torch.Tensor
+
+    def __init__(self) -> None:
         super().__init__()
-        self._rel = RelMetric(mrr, hits)
-        self._ent = EntMetric(mrr, hits)
+        self.add_state("ent_ranks", torch.tensor([]))
+        self.add_state("rel_ranks", torch.tensor([]))
 
     def update(
         self,
-        ent_logit: torch.Tensor,
+        obj_logit: torch.Tensor,
         rel_logit: torch.Tensor,
-        subj: torch.Tensor,
+        obj: torch.Tensor,
         rel: torch.Tensor,
     ):
-        self._rel.update(rel_logit, rel)
-        self._ent.update(ent_logit, subj)
+        ent_ranks = logit_ranks(obj_logit, obj)
+        self.ent_ranks = torch.cat([self.ent_ranks, ent_ranks], dim=-1)
+
+        rel_ranks = logit_ranks(rel_logit, rel)
+        self.rel_ranks = torch.cat([self.rel_ranks, rel_ranks], dim=-1)
 
     def compute(self):
-        ret = {}
-        ret.update({"r_" + k: v for k, v in self._rel.compute().items()})
-        ret.update({"e_" + k: v for k, v in self._ent.compute().items()})
-        return ret
-
-
-def time_aware_mask(key1, key2, value):
-    d_dict = DefaultDict(list)
-    for k1, k2, v in zip(key1, key2, value):
-        d_dict[(k1.item(), k2.item())].append(v.item())
-    return d_dict
-
-
-def time_aware_filter(
-    logit: torch.Tensor,
-    target: torch.Tensor,
-    d_dict: Dict[Hashable, List[torch.Tensor]],
-):
-    target = tf.one_hot(target, logit.size(-1))
-
-    mask = torch.zeros_like(logit, dtype=torch.bool)
-    for rs in d_dict.values():
-        mask[rs, rs] = 1
-
-    t_logit = logit.masked_fill(mask, 0)
-    t_logit = torch.where(target != 0, logit, t_logit)
-    return t_logit
+        values = {}
+        values["r_mrr"] = mrr_value(self.rel_ranks)
+        for k in (1, 3, 10):
+            values[f"r_hit@{k}"] = hit_value(self.rel_ranks, k)
+        values["e_mrr"] = mrr_value(self.ent_ranks)
+        for k in (1, 3, 10):
+            values[f"e_hit@{k}"] = hit_value(self.ent_ranks, k)
+        return values

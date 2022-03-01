@@ -9,44 +9,8 @@ from tallow.data import vocabs
 from torch import nn, optim
 
 import tkgl
-from tkgl.metrics import EntMRR, JointMetric
 
 logger = logging.getLogger(__name__)
-
-
-def validate_module_parameters(m1: nn.Module, m2: nn.Module):
-    for p1, p2 in zip(m1.parameters(), m2.parameters()):
-        p1 = p1.cpu()
-        p2 = p2.cpu()
-        if not torch.allclose(p1, p2):
-            logger.info(f"Tensor mismatch: {p1} vs {p2}")
-
-
-def validate_state_dicts(m1: Dict, m2: Dict):
-    if len(m1) != len(m2):
-        logger.info(f"Length mismatch: {len(m1)}, {len(m2)}")
-        return False
-
-    # Replicate modules have "module" attached to their keys, so strip these off when comparing to local model.
-    if next(iter(m1.keys())).startswith("module"):
-        m1 = {k[len("module") + 1 :]: v for k, v in m1.items()}
-
-    if next(iter(m2.keys())).startswith("module"):
-        m2 = {k[len("module") + 1 :]: v for k, v in m2.items()}
-
-    for ((k_1, v_1), (k_2, v_2)) in zip(m1.items(), m2.items()):
-        if k_1 != k_2:
-            logger.info(f"Key mismatch: {k_1} vs {k_2}")
-            return False
-        # convert both to the same CUDA device
-        if str(v_1.device) != "cuda:0":
-            v_1 = v_1.to("cuda:0" if torch.cuda.is_available() else "cpu")
-        if str(v_2.device) != "cuda:0":
-            v_2 = v_2.to("cuda:0" if torch.cuda.is_available() else "cpu")
-
-        if not torch.allclose(v_1, v_2):
-            logger.info(f"Tensor mismatch: {v_1} vs {v_2}")
-            # return False
 
 
 def build_model(cfg, tknzs: Dict[str, vocabs.Vocab]):
@@ -59,8 +23,9 @@ def build_model(cfg, tknzs: Dict[str, vocabs.Vocab]):
             kernel_size=cfg["kernel_size"],
             channels=cfg["channels"],
             dropout=cfg["dropout"],
+            norm_embeds=cfg["norm_embeds"],
         )
-        criterion = tkgl.models.criterions.JointLoss()
+        criterion = tkgl.models.criterions.JointLoss(balance=cfg["alpha"])
     elif cfg["arch"] == "tconv":
         model = tkgl.models.Tconv(
             len(tknzs["ent"]),
@@ -73,7 +38,7 @@ def build_model(cfg, tknzs: Dict[str, vocabs.Vocab]):
             channels=cfg["channels"],
             dropout=cfg["dropout"],
         )
-        criterion = tkgl.models.criterions.JointLoss()
+        criterion = tkgl.models.criterions.JointLoss(balance=cfg["alpha"])
     elif cfg["arch"] == "refine":
         model = tkgl.models.Refine(
             len(tknzs["ent"]),
@@ -84,7 +49,10 @@ def build_model(cfg, tknzs: Dict[str, vocabs.Vocab]):
             kernel_size=cfg["kernel_size"],
             dropout=cfg["dropout"],
         )
-        criterion = tkgl.models.criterions.RefineLoss()
+        criterion = tkgl.models.criterions.JointLoss(balance=cfg["alpha"])
+        # criterion = tkgl.models.criterions.RefineLoss(
+        #     alpha=cfg["alpha"], beta=cfg["beta"]
+        # )
     else:
         raise ValueError()
     logger.info(f"Model: {model.__class__.__name__}")
@@ -98,6 +66,8 @@ def load_tkg_data(cfg):
         cfg["hist_len"],
         bidirectional=cfg["bidirectional"],
         different_unknowns=cfg["different_unknowns"],
+        complement_val_and_test=cfg["complement_val_and_test"],
+        shuffle=cfg["shuffle"],
     )
     return datasets, vocabs
 
@@ -120,32 +90,48 @@ def main():
     model, criterion = build_model(cfg["model"], vocabs)
 
     def _init_optim(m: nn.Module):
-        return optim.Adam(m.parameters(), lr=cfg["lr"])
+        optimizer = optim.Adam(
+            m.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"]
+        )
+        clip_norm = None
+        if cfg["grad_norm"]:
+            clip_norm = lambda: nn.utils.clip_grad.clip_grad_norm_(
+                m.parameters(), cfg["grad_norm"]
+            )
+
+        return (optimizer, clip_norm)
 
     val_metric = tkgl.metrics.EntMRR()
 
+    hooks = []
     ckpt = trainers.hooks.CheckpointHook(
         cfg["save_folder_path"], reload_on_begin=True
     )
+    hooks.append(ckpt)
     earlystop = trainers.hooks.EarlyStopHook(
         cfg["save_folder_path"], patient=cfg["patient"]
     )
+    hooks.append(earlystop)
+    if cfg["val_test"]:
+        val_hook = trainers.hooks.EvaluateHook({"test": datasets["test"]})
+        hooks.append(val_hook)
+
     trainer = trainers.SupervisedTrainer(
         model,
         criterion=criterion,
         init_optim=_init_optim,
         metric=val_metric,
-        _hooks=[ckpt, earlystop],
+        _hooks=hooks,
     )
     trainer.execute(datasets["train"], eval_data=datasets["val"])
 
-    metric = JointMetric()
-    evaluator = evaluators.trainer_evaluator(trainer, metric)
+    full_metric = tkgl.metrics.JointMetric()
+    evaluator = evaluators.trainer_evaluator(trainer, full_metric)
     evaluator.model.load_state_dict(
         torch.load(earlystop.best_model_path)["model"]
     )
     metric_dataframe = evaluator.execute(datasets)
-    print(metric_dataframe)
+    print(metric_dataframe.T * 100)
 
 
 if __name__ == "__main__":

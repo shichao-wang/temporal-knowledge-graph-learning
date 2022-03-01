@@ -13,8 +13,7 @@ class RGCNLayer(nn.Module):
 
     def forward(self, graph: dgl.DGLGraph):
         def message_func(edges: EdgeBatch):
-            t = edges.src["h"] + edges.data["h"]
-            h = torch.cat([t, edges.dst["h"]], dim=-1)
+            h = torch.cat([edges.src["h"], edges.data["h"]], dim=-1)
             msg = self._linear(h) * edges.data["norm"]
             return {"msg": msg}
 
@@ -38,7 +37,7 @@ class RGCN(nn.Module):
         ent_embeds: torch.Tensor,
         rel_embeds: torch.Tensor,
     ):
-        graph.ndata["h"] = ent_embeds
+        graph.ndata["h"] = ent_embeds[graph.ndata["ent_id"]]
         graph.edata["h"] = rel_embeds[graph.edata["rel_id"]]
 
         for layer in self._layers:

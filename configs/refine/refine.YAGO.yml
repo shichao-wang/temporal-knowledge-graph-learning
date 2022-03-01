@@ -1,0 +1,26 @@
+data:
+  data_folder: "./datasets"
+  dataset: YAGO
+  hist_len: 1 
+  bidirectional: true
+  different_unknowns: true
+  complement_val_and_test: true
+  shuffle: true
+
+model:
+  arch: refine
+  hidden_size: 200
+  num_layers: 1
+  kernel_size: 3
+  channels: 50
+  dropout: 0.2
+  norm_embeds: true
+  alpha: 0.7
+  beta: 0.8
+
+save_folder_path: "./saved_models/refine-YAGO"
+patient: 5
+lr: 1.0e-3
+weight_decay: 1.0e-5
+grad_norm: 1.0
+val_test: false

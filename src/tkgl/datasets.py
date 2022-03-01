@@ -35,20 +35,31 @@ class ExtrapolateTKGDataset(datasets.Dataset[TkgRExample]):
         temporal_quads: List[List[Quadruple]],
         hist_len: Optional[int],
         vocabs: Dict[str, vocabs.Vocab],
+        prepend_quads: List[List[Quadruple]] = None,
     ) -> None:
         super().__init__()
         self._temporal_quads = temporal_quads
         self._hist_len = hist_len
         self._vocabs = vocabs
 
+        if prepend_quads is None:
+            prepend_quads = []
+        else:
+            assert len(prepend_quads) == hist_len
+        self._prepend_quads = prepend_quads
+        self._hist_graphs = [
+            build_knowledge_graph(quads, self._vocabs)
+            for quads in self._temporal_quads
+        ]
+
     def __iter__(self):
-        for future in range(1, len(self._temporal_quads)):
+        total_quads = self._prepend_quads + self._temporal_quads
+        for future in range(
+            len(self._prepend_quads) + 1, len(self._temporal_quads)
+        ):
             xlice = slice(max(future - self._hist_len, 0), future)
-            hist_graphs = [
-                build_knowledge_graph(quads, self._vocabs)
-                for quads in self._temporal_quads[xlice]
-            ]
-            quadruples = self._temporal_quads[future]
+            hist_graphs = self._hist_graphs[xlice]
+            quadruples = total_quads[future]
             subjs = [quad["subj"] for quad in quadruples]
             rels = [quad["rel"] for quad in quadruples]
             objs = [quad["obj"] for quad in quadruples]
@@ -63,7 +74,10 @@ class ExtrapolateTKGDataset(datasets.Dataset[TkgRExample]):
             yield datasets.Batch(example)
 
     def __len__(self):
-        return len(self._temporal_quads) - 1
+        if self._prepend_quads:
+            return len(self._temporal_quads)
+        else:
+            return len(self._temporal_quads) - 1
 
 
 def groupby_temporal(quadruples: List[Quadruple]) -> List[List[Quadruple]]:
@@ -182,6 +196,8 @@ def load_tkg_dataset(
     hist_len: int,
     bidirectional: bool,
     different_unknowns: bool,
+    complement_val_and_test: bool,
+    shuffle: bool,
 ) -> Tuple[Dict[str, ExtrapolateTKGDataset], Dict[str, vocabs.Vocab]]:
     subsets = ("train", "val", "test")
     quadruples: Dict[str, List[Quadruple]] = {}
@@ -196,9 +212,34 @@ def load_tkg_dataset(
         vocab_quads.extend(quadruples["val"])
         vocab_quads.extend(quadruples["test"])
     vocabs = build_vocab_from_quadruples(vocab_quads)
-    datasets = {}
+
+    temporal_quads = {}
     for subset in subsets:
-        temporal_quads = groupby_temporal(quadruples[subset])
-        dataset = ExtrapolateTKGDataset(temporal_quads, hist_len, vocabs)
-        datasets[subset] = dataset
+        temporal_quads[subset] = groupby_temporal(quadruples[subset])
+
+    datasets = {}
+    if complement_val_and_test:
+        datasets["train"] = ExtrapolateTKGDataset(
+            temporal_quads["train"], hist_len, vocabs
+        )
+        datasets["val"] = ExtrapolateTKGDataset(
+            temporal_quads["val"],
+            hist_len,
+            vocabs,
+            temporal_quads["train"][-hist_len:],
+        )
+        datasets["test"] = ExtrapolateTKGDataset(
+            temporal_quads["test"],
+            hist_len,
+            vocabs,
+            temporal_quads["val"][-hist_len:],
+        )
+    else:
+        for subset in subsets:
+            dataset = ExtrapolateTKGDataset(
+                temporal_quads[subset], hist_len, vocabs
+            )
+            datasets[subset] = dataset
+    if shuffle:
+        datasets["train"] = datasets["train"].shuffle()
     return datasets, vocabs

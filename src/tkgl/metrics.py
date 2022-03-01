@@ -24,11 +24,11 @@ def logit_ranks(logit: torch.Tensor, target: torch.Tensor):
 
 
 def mrr_value(ranks: torch.Tensor):
-    return (1 / (ranks + 1)).mean(dim=-1)
+    return torch.mean(1.0 / (ranks.float() + 1))
 
 
 def hit_value(ranks: torch.Tensor, k: int):
-    return (ranks < k).float().mean(dim=-1)
+    return (ranks < k).float().mean()
 
 
 class MRR(RankMetric):

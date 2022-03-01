@@ -26,7 +26,7 @@ def main():
     metric = tkgl.metrics.JointMetric()
     evaluator = evaluators.Evaluator(model, metric)
     results = evaluator.execute(datasets)
-    print(results)
+    print(results.T * 100)
 
 
 if __name__ == "__main__":

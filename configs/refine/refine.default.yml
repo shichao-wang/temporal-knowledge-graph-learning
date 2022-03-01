@@ -4,6 +4,8 @@ data:
   hist_len: 3 
   bidirectional: true
   different_unknowns: true
+  complement_val_and_test: true
+  shuffle: true
 
 model:
   arch: refine
@@ -12,6 +14,8 @@ model:
   kernel_size: 3
   channels: 50
   dropout: 0.2
+  alpha: 0.7
+  beta: 0.8
 
 save_folder_path: null
 patient: 5

@@ -15,14 +15,14 @@ class JointLoss(nn.Module):
         rel_logit: torch.Tensor,
         rel: torch.Tensor,
     ):
-        rel_loss = tf.cross_entropy(rel_logit, rel, reduction="none")
-        ent_loss = tf.cross_entropy(obj_logit, obj, reduction="none")
+        rel_loss = tf.cross_entropy(rel_logit, rel)
+        ent_loss = tf.cross_entropy(obj_logit, obj)
         return ent_loss * self._balance + rel_loss * (1 - self._balance)
 
 
 class EntLoss(nn.Module):
     def forward(self, obj_logit: torch.Tensor, obj: torch.Tensor):
-        return tf.cross_entropy(obj_logit, obj, reduction="none")
+        return tf.cross_entropy(obj_logit, obj)
 
 
 class RefineLoss(torch.nn.Module):

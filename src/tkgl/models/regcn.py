@@ -1,9 +1,9 @@
-from typing import List
+from typing import List, Tuple
 
 import dgl
 import torch
 from dgl.udf import EdgeBatch
-from torch import Tensor, nn
+from torch import nn
 from torch.nn import functional as tnf
 
 
@@ -22,8 +22,7 @@ class OmegaRelGraphConv(nn.Module):
     def forward(
         self,
         graph: dgl.DGLHeteroGraph,
-        node_feats: torch.Tensor,
-        edge_feats: torch.Tensor,
+        features: Tuple[torch.Tensor],
     ) -> torch.Tensor:
         """
         Arguments:
@@ -32,9 +31,9 @@ class OmegaRelGraphConv(nn.Module):
             rel_embeds: (num_edges, input_size)
         """
         for layer in self._layers:
-            node_feats, edge_feats = layer(graph, node_feats, edge_feats)
+            features = layer(graph, features)
 
-        return node_feats, edge_feats
+        return features
 
     class Layer(nn.Module):
         """
@@ -54,8 +53,7 @@ class OmegaRelGraphConv(nn.Module):
         def forward(
             self,
             graph: dgl.DGLHeteroGraph,
-            node_feats: torch.Tensor,
-            edges_feats: torch.Tensor,
+            features: Tuple[torch.Tensor, torch.Tensor],
         ) -> torch.Tensor:
             """
             Arguments:
@@ -70,7 +68,7 @@ class OmegaRelGraphConv(nn.Module):
                 return {"msg": msg}
 
             with graph.local_scope():
-                graph.ndata["h"], graph.edata["h"] = node_feats, edges_feats
+                graph.ndata["h"], graph.edata["h"] = features
 
                 self_msg = self._linear2(graph.ndata["h"])
                 isolate_nids = torch.masked_select(
@@ -196,7 +194,7 @@ class REGCN(nn.Module):
             n_rel_embeds = self._origin_or_norm(n_rel_embeds)
             # entity evolution
             edge_feats = n_rel_embeds[graph.edata["rid"]]
-            node_feats, _ = self._rgcn(graph, ent_embeds, edge_feats)
+            node_feats, _ = self._rgcn(graph, (ent_embeds, edge_feats))
             node_feats = self._origin_or_norm(node_feats)
             u = torch.sigmoid(self._linear(ent_embeds))
             n_ent_embeds = ent_embeds + u * (node_feats - ent_embeds)
@@ -211,7 +209,7 @@ class REGCN(nn.Module):
 
         return {"obj_logit": obj_logit, "rel_logit": rel_logit}
 
-    def _origin_or_norm(self, tensor: Tensor):
+    def _origin_or_norm(self, tensor: torch.Tensor):
         if self._norm_embeds:
             return tnf.normalize(tensor)
         return tensor
@@ -224,17 +222,16 @@ class REGCN(nn.Module):
             (num_rels, hidden_size)
         """
         # (num_rels, num_nodes)
-        rel_ent_mask = node_feats.new_zeros(
+        rel_node_mask = node_feats.new_zeros(
             self.rel_embeds.size(0), node_feats.size(0), dtype=torch.bool
         )
         src, dst, eids = graph.edges("all")
         rel_ids = graph.edata["rid"][eids]
-        rel_ent_mask[rel_ids, src] = True
-        rel_ent_mask[rel_ids, dst] = True
+        rel_node_mask[rel_ids, src] = True
+        rel_node_mask[rel_ids, dst] = True
 
-        ent_ids = torch.nonzero(rel_ent_mask)[:, 1]
+        node_ids = torch.nonzero(rel_node_mask)[:, 1]
         rel_embeds = dgl.ops.segment_reduce(
-            rel_ent_mask.sum(dim=1), node_feats[ent_ids], "mean"
+            rel_node_mask.sum(dim=1), node_feats[node_ids], "mean"
         )
-        x = torch.nan_to_num(rel_embeds, 0)
-        return x
+        return torch.nan_to_num(rel_embeds, 0)

@@ -1,6 +1,6 @@
 data:
   data_folder: "./datasets"
-  dataset: ICEWS18
+  dataset: ICEWS18 
   hist_len: 6 
   bidirectional: true
   different_unknowns: true
@@ -8,18 +8,17 @@ data:
   shuffle: true
 
 model:
-  arch: refine
+  arch: tconv
   hidden_size: 200
   num_layers: 2
   kernel_size: 3
+  num_kernels: 5
   channels: 50
   dropout: 0.2
   norm_embeds: true
-  k: 10
   alpha: 0.7
-  beta: 0.8
 
-save_folder_path: "./saved_models/refine-ICEWS18"
+save_folder_path: "./saved_models/tconv-ICEWS18"
 patient: 5
 lr: 1.0e-3
 weight_decay: 1.0e-5

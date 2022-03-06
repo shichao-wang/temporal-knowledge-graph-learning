@@ -1,35 +1,135 @@
+from typing import List
+
+import dgl
 import torch
+from dgl.udf import EdgeBatch
 from torch import nn
 
 
-class RecurrentGCN(nn.Module):
-    def __init__(self):
+def edge_neighbor_subgraph(graph: dgl.DGLGraph, ent_ids: torch.Tensor):
+    def is_adj(edges: EdgeBatch):
+        dst_mask = torch.sum(
+            edges.dst["ent_id"] == ent_ids[..., None], dim=0, dtype=torch.bool
+        )
+        src_mask = torch.sum(
+            edges.src["ent_id"] == ent_ids[..., None], dim=0, dtype=torch.bool
+        )
+        mask = torch.bitwise_or(dst_mask, src_mask)
+        return mask
+
+    cgraph = graph.cpu()
+    edges = graph.filter_edges(is_adj)
+
+    sg = dgl.edge_subgraph(
+        cgraph, torch.Tensor.cpu(edges), relabel_nodes=False
+    ).to(graph.device)
+    return sg
+
+
+def node_neighbor_subgraph(graph: dgl.DGLGraph, ent_ids: torch.Tensor):
+    node_ids = torch.nonzero(graph.ndata["ent_id"] == ent_ids[..., None])[:, -1]
+    adj_mat: torch.Tensor = torch.Tensor.to_dense(graph.adj())
+    degrees = torch.sum(adj_mat[node_ids, :] + adj_mat[:, node_ids].t(), dim=0)
+    degrees[node_ids] += 1
+    subgraph_nodes = torch.nonzero(degrees)[:, 0].to(ent_ids)
+    sg: dgl.DGLGraph = dgl.node_subgraph(graph, subgraph_nodes)
+    return sg
+
+
+class RENet(torch.nn.Module):
+    def __init__(
+        self, num_ents: int, num_rels: int, hidden_size: int, num_layers: int
+    ):
         super().__init__()
-        self._encoder = None
 
-    def forward(self):
-        pass
+        self._rgcn = RelGraphConv(hidden_size, hidden_size, num_layers)
+
+        self._obj_decoder = RecurrentE(num_ents, hidden_size, hidden_size)
+        self._rel_decoder = RecurrentR(num_rels, hidden_size, hidden_size)
+
+        self.ent_embeds = nn.Parameter(torch.zeros(num_ents, hidden_size))
+        self.rel_embeds = nn.Parameter(torch.zeros(num_rels, hidden_size))
+        nn.init.xavier_normal_(self.ent_embeds)
+        nn.init.xavier_uniform_(self.rel_embeds)
+
+    def forward(
+        self,
+        hist_graphs: List[dgl.DGLGraph],
+        subj: torch.Tensor,
+        rel: torch.Tensor,
+        obj: torch.Tensor,
+    ):
+        subj_hists = [
+            edge_neighbor_subgraph(graph, subj) for graph in hist_graphs
+        ]
+        bg = dgl.batch(subj_hists)
+        node_feats = self._rgcn(bg, self.ent_embeds, self.rel_embeds)
+        batch_num_nodes_list = bg.batch_num_nodes().tolist()
+        total_feats_split = torch.split(node_feats, batch_num_nodes_list)
+        total_ent_split = torch.split(bg.ndata["ent_id"], batch_num_nodes_list)
+        subj_feats = []
+        for ent_ids, feats in zip(total_ent_split, total_feats_split):
+            indexes = torch.nonzero(ent_ids == subj.unsqueeze(dim=-1))[:, 1]
+            subj_feats.append(feats[indexes])
+        subj_embeds = torch.stack(subj_feats, dim=1)
+
+        # (hist_len, 3 * h)
+        obj_logit = self._obj_decoder(
+            self.ent_embeds, self.rel_embeds, subj, rel, subj_embeds
+        )
+        rel_logit = self._rel_decoder(self.ent_embeds, subj, obj, subj_embeds)
+        return {"obj_logit": obj_logit, "rel_logit": rel_logit}
 
 
-class RGCN(nn.Module):
-    pass
-
-
-class RGCNPooling(nn.Module):
-    def __init__(self):
+class RecurrentE(torch.nn.Module):
+    def __init__(self, num_classes: int, input_size: int, hidden_size: int):
         super().__init__()
+        self._rnn = nn.GRU(3 * input_size, hidden_size, batch_first=True)
+        self._linear = nn.Linear(2 * input_size + hidden_size, num_classes)
 
-    def forward(self):
-        pass
+    def forward(
+        self,
+        ent_embeds: torch.Tensor,
+        rel_embeds: torch.Tensor,
+        subj: torch.Tensor,
+        rel: torch.Tensor,
+        subj_embeds: torch.Tensor,
+    ):
+        hist_len = subj_embeds.size(1)
+        ex_ent_embeds = ent_embeds[subj].unsqueeze(1).repeat(1, hist_len, 1)
+        ex_rel_embeds = rel_embeds[rel].unsqueeze(1).repeat(1, hist_len, 1)
+        # (num_preds, hist_len, h)
+        inputs = torch.cat([subj_embeds, ex_ent_embeds, ex_rel_embeds], dim=-1)
+        _, output = self._rnn(inputs)
+        x = torch.cat(
+            [ent_embeds[subj], rel_embeds[rel], torch.squeeze(output, dim=0)],
+            dim=-1,
+        )
+        logit = self._linear(x)
+        return logit
 
 
-class MeanPooling(nn.Module):
-    def __init__(self):
+class RecurrentR(torch.nn.Module):
+    def __init__(self, num_classes: int, input_size: int, hidden_size: int):
         super().__init__()
+        self._rnn = nn.GRU(3 * input_size, hidden_size, batch_first=True)
+        self._linear = nn.Linear(2 * input_size + hidden_size, num_classes)
 
-    def forward(self, ent_embed: torch.Tensor, rel_embed: torch.Tensor):
-        pass
-
-
-class AttentivePooling(nn.Module):
-    pass
+    def forward(
+        self,
+        ent_embeds: torch.Tensor,
+        subj: torch.Tensor,
+        obj: torch.Tensor,
+        subj_embeds: torch.Tensor,
+    ):
+        hist_len = subj_embeds.size(1)
+        ex_ent_embeds = ent_embeds[subj].unsqueeze(1).repeat(1, hist_len, 1)
+        ex_rel_embeds = ent_embeds[obj].unsqueeze(1).repeat(1, hist_len, 1)
+        inputs = torch.cat([subj_embeds, ex_ent_embeds, ex_rel_embeds], dim=-1)
+        _, output = self._rnn(inputs)
+        x = torch.cat(
+            [ent_embeds[subj], ent_embeds[obj], torch.squeeze(output, dim=0)],
+            dim=-1,
+        )
+        logit = self._linear(x)
+        return logit

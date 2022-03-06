@@ -9,6 +9,7 @@ from tallow.data import vocabs
 from torch import nn, optim
 
 import tkgl
+from tkgl.models.criterions import JointLoss
 
 logger = logging.getLogger(__name__)
 
@@ -26,21 +27,31 @@ def build_model(cfg, tknzs: Dict[str, vocabs.Vocab]):
             norm_embeds=cfg["norm_embeds"],
         )
         criterion = tkgl.models.criterions.JointLoss(balance=cfg["alpha"])
-    elif cfg["arch"] == "tconv":
-        model = tkgl.models.Tconv(
+    elif cfg["arch"] == "renet":
+        from tkgl.models.renet import RENet
+
+        model = RENet(
             len(tknzs["ent"]),
             len(tknzs["rel"]),
-            hist_len=cfg["hist_len"],
-            hidden_size=cfg["hidden_size"],
-            num_kernels=cfg["num_kernels"],
-            num_layers=cfg["num_layers"],
-            kernel_size=cfg["kernel_size"],
-            channels=cfg["channels"],
-            dropout=cfg["dropout"],
+            cfg["hidden_size"],
+            cfg["num_layers"],
+        )
+        criterion = tkgl.models.criterions.JointLoss(balance=cfg["alpha"])
+    elif cfg["arch"] == "evokg":
+        from tkgl.models.evokg import EvoKg
+
+        model = EvoKg(
+            len(tknzs["ent"]),
+            len(tknzs["rel"]),
+            cfg["hidden_size"],
+            cfg["num_layers"],
+            cfg["dropout"],
         )
         criterion = tkgl.models.criterions.JointLoss(balance=cfg["alpha"])
     elif cfg["arch"] == "refine":
-        model = tkgl.models.Refine(
+        from tkgl.models.refine import Refine
+
+        model = Refine(
             len(tknzs["ent"]),
             len(tknzs["rel"]),
             hidden_size=cfg["hidden_size"],
@@ -48,11 +59,12 @@ def build_model(cfg, tknzs: Dict[str, vocabs.Vocab]):
             channels=cfg["channels"],
             kernel_size=cfg["kernel_size"],
             dropout=cfg["dropout"],
+            norm_embeds=cfg["norm_embeds"],
+            k=cfg["k"],
+            num_heads=4,
         )
-        criterion = tkgl.models.criterions.JointLoss(balance=cfg["alpha"])
-        # criterion = tkgl.models.criterions.RefineLoss(
-        #     alpha=cfg["alpha"], beta=cfg["beta"]
-        # )
+        criterion = JointLoss(cfg["alpha"])
+
     else:
         raise ValueError()
     logger.info(f"Model: {model.__class__.__name__}")

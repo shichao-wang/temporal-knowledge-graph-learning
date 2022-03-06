@@ -32,14 +32,14 @@ subsets = ("train", "val", "test")
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-folder")
+    parser.add_argument("data_folder")
     args = parser.parse_args()
 
     data_folder = args.data_folder
     assert os.path.exists(data_folder)
     results = {}
     for subset in subsets:
-        data_file = subset + ".txt"
+        data_file = subset + ".tsv"
         data_path = os.path.join(data_folder, data_file)
         subset_results = count_file(data_path)
         print(f"Count {subset}")

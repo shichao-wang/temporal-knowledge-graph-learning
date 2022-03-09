@@ -1,6 +1,5 @@
 data:
-  data_folder: "./datasets"
-  dataset: YAGO
+  data_folder: "./datasets/YAGO"
   hist_len: 1 
   bidirectional: true
   different_unknowns: true
@@ -8,7 +7,7 @@ data:
   shuffle: true
 
 model:
-  arch: regcn
+  arch: tkgl.models.regcn.REGCN
   hidden_size: 200
   num_layers: 1
   kernel_size: 3
@@ -17,9 +16,8 @@ model:
   norm_embeds: true
   alpha: 0.7
 
-save_folder_path: "./saved_models/regcn-YAGO"
-patient: 5
-lr: 1.0e-3
-weight_decay: 1.0e-5
-grad_norm: 1.0
-val_test: false
+training:
+  patient: 5
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  grad_norm: 1.0

@@ -1,0 +1,32 @@
+data:
+  data_folder: "./datasets/YAGO"
+  hist_len: 1 
+  bidirectional: true
+  different_unknowns: true
+  complement_val_and_test: true
+  shuffle: true
+
+model:
+  arch: tkgl.models.rerank.TemporalRerank
+  backbone: 
+    arch: tkgl.models.regcn.REGCN
+    hidden_size: 200
+    num_layers: 1
+    kernel_size: 3
+    channels: 50
+    dropout: 0.2
+    norm_embeds: true
+  k: 10
+  num_layers: 2
+  dropout: 0.2
+  finetune: true
+  pretrained_backbone: null
+
+  alpha: 0.7
+  beta: 0.8
+
+training:
+  patient: 5
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  grad_norm: 1.0

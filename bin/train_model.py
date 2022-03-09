@@ -1,148 +1,33 @@
-import logging
-import os
-from typing import Dict
-
-import torch
+import molurus
 from molurus import config_dict
-from tallow import evaluators, trainers
-from tallow.data import vocabs
-from torch import nn, optim
 
-import tkgl
-from tkgl.models.criterions import JointLoss
-
-logger = logging.getLogger(__name__)
-
-
-def build_model(cfg, tknzs: Dict[str, vocabs.Vocab]):
-    if cfg["arch"] == "regcn":
-        model = tkgl.models.REGCN(
-            len(tknzs["ent"]),
-            len(tknzs["rel"]),
-            hidden_size=cfg["hidden_size"],
-            num_layers=cfg["num_layers"],
-            kernel_size=cfg["kernel_size"],
-            channels=cfg["channels"],
-            dropout=cfg["dropout"],
-            norm_embeds=cfg["norm_embeds"],
-        )
-        criterion = tkgl.models.criterions.JointLoss(balance=cfg["alpha"])
-    elif cfg["arch"] == "renet":
-        from tkgl.models.renet import RENet
-
-        model = RENet(
-            len(tknzs["ent"]),
-            len(tknzs["rel"]),
-            cfg["hidden_size"],
-            cfg["num_layers"],
-        )
-        criterion = tkgl.models.criterions.JointLoss(balance=cfg["alpha"])
-    elif cfg["arch"] == "evokg":
-        from tkgl.models.evokg import EvoKg
-
-        model = EvoKg(
-            len(tknzs["ent"]),
-            len(tknzs["rel"]),
-            cfg["hidden_size"],
-            cfg["num_layers"],
-            cfg["dropout"],
-        )
-        criterion = tkgl.models.criterions.JointLoss(balance=cfg["alpha"])
-    elif cfg["arch"] == "refine":
-        from tkgl.models.refine import Refine
-
-        model = Refine(
-            len(tknzs["ent"]),
-            len(tknzs["rel"]),
-            hidden_size=cfg["hidden_size"],
-            num_layers=cfg["num_layers"],
-            channels=cfg["channels"],
-            kernel_size=cfg["kernel_size"],
-            dropout=cfg["dropout"],
-            norm_embeds=cfg["norm_embeds"],
-            k=cfg["k"],
-            num_heads=4,
-        )
-        criterion = JointLoss(cfg["alpha"])
-
-    else:
-        raise ValueError()
-    logger.info(f"Model: {model.__class__.__name__}")
-    logger.info(f"Criterion: {criterion.__class__.__name__}")
-    return model, criterion
-
-
-def load_tkg_data(cfg):
-    datasets, vocabs = tkgl.datasets.load_tkg_dataset(
-        os.path.join(cfg["data_folder"], cfg["dataset"]),
-        cfg["hist_len"],
-        bidirectional=cfg["bidirectional"],
-        different_unknowns=cfg["different_unknowns"],
-        complement_val_and_test=cfg["complement_val_and_test"],
-        shuffle=cfg["shuffle"],
-    )
-    return datasets, vocabs
+from tkgl.models import tkgr_model
+from tkgl.trials import TkgrTrial
 
 
 def main():
-    cfg = config_dict.parse()
-    assert "save_folder_path" in cfg
-    os.makedirs(cfg["save_folder_path"], exist_ok=True)
-    with open(os.path.join(cfg["save_folder_path"], "config.yml"), "w") as fp:
-        config_dict.dump(cfg, fp)
-    datasets, vocabs = load_tkg_data(cfg["data"])
+    parser = config_dict.ArgumentParser()
+    parser.add_argument("--save-folder-path")
+    args = parser.parse_args()
+    cfg = config_dict.load(args.cfg, args.overrides)
 
-    num_entities = len(vocabs["ent"])
-    print(f"# entities {num_entities}")
-    num_relations = len(vocabs["rel"])
-    print(f"# relations {num_relations}")
-    num_edges = datasets["train"]
-    print(f"# edges {num_edges}")
+    trial = TkgrTrial(args.save_folder_path)
+    trial.validate_and_dump_config(cfg)
 
-    model, criterion = build_model(cfg["model"], vocabs)
-
-    def _init_optim(m: nn.Module):
-        optimizer = optim.Adam(
-            m.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"]
-        )
-        clip_norm = None
-        if cfg["grad_norm"]:
-            clip_norm = lambda: nn.utils.clip_grad.clip_grad_norm_(
-                m.parameters(), cfg["grad_norm"]
-            )
-
-        return (optimizer, clip_norm)
-
-    val_metric = tkgl.metrics.EntMRR()
-
-    hooks = []
-    ckpt = trainers.hooks.CheckpointHook(
-        cfg["save_folder_path"], reload_on_begin=True
+    datasets, vocabs = trial.load_datasets_and_vocab(cfg["data"])
+    model = tkgr_model.build_model(
+        cfg["model"], num_ents=len(vocabs["ent"]), num_rels=len(vocabs["rel"])
     )
-    hooks.append(ckpt)
-    earlystop = trainers.hooks.EarlyStopHook(
-        cfg["save_folder_path"], patient=cfg["patient"]
-    )
-    hooks.append(earlystop)
-    if cfg["val_test"]:
-        val_hook = trainers.hooks.EvaluateHook({"test": datasets["test"]})
-        hooks.append(val_hook)
+    criterion = molurus.smart_call(model.build_criterion, cfg["model"])
 
-    trainer = trainers.SupervisedTrainer(
+    state_dict = trial.train_model(
         model,
-        criterion=criterion,
-        init_optim=_init_optim,
-        metric=val_metric,
-        _hooks=hooks,
+        datasets["train"],
+        criterion,
+        val_data=datasets["val"],
+        tr_cfg=cfg["training"],
     )
-    trainer.execute(datasets["train"], eval_data=datasets["val"])
-
-    full_metric = tkgl.metrics.JointMetric()
-    evaluator = evaluators.trainer_evaluator(trainer, full_metric)
-    evaluator.model.load_state_dict(
-        torch.load(earlystop.best_model_path)["model"]
-    )
-    metric_dataframe = evaluator.execute(datasets)
+    metric_dataframe = trial.eval_model(model, datasets["test"], state_dict)
     print(metric_dataframe.T * 100)
 
 

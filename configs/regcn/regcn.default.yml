@@ -1,3 +1,4 @@
+save_folder_path: null
 data:
   data_folder: "/home/wangshichao/workspace/temporal-knowledge-graph-learning/datasets"
   dataset: null 
@@ -16,6 +17,11 @@ model:
   dropout: 0.2
   alpha: 0.7
 
-save_folder_path: null
+train:
+  grad_norm: 1.0
+  optim: 
+    lr: 1.0e-3
+  patient: 5
+
 patient: 5
 lr: 1.0e-3

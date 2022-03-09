@@ -1,13 +1,3 @@
-from .criterions import JointLoss, JointSigmoidLoss
-from .refine import Refine
-from .regcn import REGCN
-from .tconv import Tconv
+from tkgl.models.tkgr_model import TkgrModel
 
-__all__ = [
-    "REGCN",
-    "Tconv",
-    "criterions",
-    "Refine",
-    "JointLoss",
-    "JointSigmoidLoss",
-]
+__all__ = ["TkgrModel"]

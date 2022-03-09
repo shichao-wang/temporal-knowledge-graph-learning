@@ -7,14 +7,23 @@ data:
   shuffle: true
 
 model:
-  arch: tkgl.models.regcn.REGCN
-  hidden_size: 200
+  arch: tkgl.models.rerank.TemporalRerank
+  backbone: 
+    arch: tkgl.models.regcn.REGCN
+    hidden_size: 200
+    num_layers: 2
+    kernel_size: 3
+    channels: 50
+    dropout: 0.2
+    norm_embeds: true
+  k: 10
   num_layers: 2
-  kernel_size: 3
-  channels: 50
   dropout: 0.2
-  norm_embeds: true
+  finetune: false
+  pretrained_backbone: null
+
   alpha: 0.7
+  beta: 0.8
 
 training:
   patient: 5

@@ -74,10 +74,10 @@ class JointMetric(torchmetrics.Metric):
 
     def compute(self):
         values = {}
-        values["r_mrr"] = mrr_value(self.rel_ranks)
-        for k in (1, 3, 10):
-            values[f"r_hit@{k}"] = hit_value(self.rel_ranks, k)
         values["e_mrr"] = mrr_value(self.ent_ranks)
         for k in (1, 3, 10):
             values[f"e_hit@{k}"] = hit_value(self.ent_ranks, k)
+        values["r_mrr"] = mrr_value(self.rel_ranks)
+        for k in (1, 3, 10):
+            values[f"r_hit@{k}"] = hit_value(self.rel_ranks, k)
         return values

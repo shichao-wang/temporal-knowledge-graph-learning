@@ -11,3 +11,7 @@ There are 4 columns in each file, represent subject(head), relation, object(tail
 - WIKI: TITer
 - TAGO: TITer
 - GDELT: RE-GCN
+
+# GDELT-EventCode.tsv
+http://data.gdeltproject.org/documentation/CAMEO.Manual.1.1b3.pdf
+https://mind-node.net/cameo-event-codes/

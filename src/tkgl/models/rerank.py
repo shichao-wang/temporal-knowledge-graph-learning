@@ -1,6 +1,5 @@
 import copy
-import warnings
-from asyncio.log import logger
+import logging
 from typing import List
 
 import dgl
@@ -9,6 +8,8 @@ from torch.nn import functional as tfn
 
 from .regcn import OmegaRelGraphConv
 from .tkgr_model import TkgrModel
+
+logger = logging.getLogger(__name__)
 
 
 class TemporalRerank(TkgrModel):
@@ -27,14 +28,13 @@ class TemporalRerank(TkgrModel):
         hid_sz = self._backbone.hidden_size
         self._rgcn = OmegaRelGraphConv(hid_sz, hid_sz, num_layers, dropout)
         self.obj_score = copy.deepcopy(self._backbone.obj_score)
+        self._finetune = finetune
+
         if pretrained_backbone:
             logger.info("Load backbone from %s", pretrained_backbone)
             backbone_state = torch.load(pretrained_backbone)["model"]
             self._backbone.load_state_dict(backbone_state)
-        else:
-            if not finetune:
-                logger.warning("Plain backbone should be finetuned.")
-        self._backbone.requires_grad_(finetune)
+        self._backbone.requires_grad_(self._finetune)
 
     def forward(
         self,
@@ -43,7 +43,8 @@ class TemporalRerank(TkgrModel):
         rel: torch.Tensor,
         obj: torch.Tensor,
     ):
-        backbone_outputs = self._backbone(hist_graphs, subj, rel, obj)
+        with torch.set_grad_enabled(self._finetune):
+            backbone_outputs = self._backbone(hist_graphs, subj, rel, obj)
         obj_logit_orig = dict.pop(backbone_outputs, "obj_logit")
         obj_pred_graph = _build_obj_pred_graph(
             self._backbone.num_ents, subj, rel, obj_logit_orig, self._k

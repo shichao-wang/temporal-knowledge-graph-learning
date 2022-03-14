@@ -1,7 +1,7 @@
 import molurus
 from molurus import config_dict
 
-from tkgl.models import tkgr_model
+from tkgl import models
 from tkgl.trials import TkgrTrial
 
 
@@ -15,7 +15,7 @@ def main():
     trial.validate_and_dump_config(cfg)
 
     datasets, vocabs = trial.load_datasets_and_vocab(cfg["data"])
-    model = tkgr_model.build_model(
+    model = models.build_model(
         cfg["model"], num_ents=len(vocabs["ent"]), num_rels=len(vocabs["rel"])
     )
     criterion = molurus.smart_call(model.build_criterion, cfg["model"])

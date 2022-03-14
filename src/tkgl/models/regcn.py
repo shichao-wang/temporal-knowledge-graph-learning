@@ -1,3 +1,4 @@
+from turtle import forward
 from typing import List, Tuple
 
 import dgl
@@ -133,6 +134,24 @@ class REGCN(TkgrModel):
             dropout=dropout,
         )
 
+    def evolve_step(
+        self, graph: dgl.DGLGraph, ent_emb: torch.Tensor, rel_emb: torch.Tensor
+    ):
+
+        # rel evolution
+        rel_ent_embeds = self._agg_rel_nodes(graph, ent_emb)
+        gru_input = torch.cat([rel_ent_embeds, self.rel_embeds], dim=-1)
+        n_rel_embeds = self._gru(gru_input, rel_emb)
+        n_rel_embeds = self._origin_or_norm(n_rel_embeds)
+        # entity evolution
+        edge_feats = n_rel_embeds[graph.edata["rid"]]
+        node_feats = self._rgcn(graph, ent_emb, edge_feats)
+        node_feats = self._origin_or_norm(node_feats)
+        u = torch.sigmoid(self._linear(ent_emb))
+        n_ent_embeds = ent_emb + u * (node_feats - ent_emb)
+
+        return n_ent_embeds, n_rel_embeds
+
     def evolve(
         self, hist_graphs: List[dgl.DGLGraph]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -141,19 +160,9 @@ class REGCN(TkgrModel):
         for graph in hist_graphs:
             # rel evolution
             # rel_ent_embeds = self.rel_embeds
-            rel_ent_embeds = self._agg_rel_nodes(graph, ent_embeds)
-            gru_input = torch.cat([rel_ent_embeds, self.rel_embeds], dim=-1)
-            n_rel_embeds = self._gru(gru_input, rel_embeds)
-            n_rel_embeds = self._origin_or_norm(n_rel_embeds)
-            # entity evolution
-            edge_feats = n_rel_embeds[graph.edata["rid"]]
-            node_feats = self._rgcn(graph, ent_embeds, edge_feats)
-            node_feats = self._origin_or_norm(node_feats)
-            u = torch.sigmoid(self._linear(ent_embeds))
-            n_ent_embeds = ent_embeds + u * (node_feats - ent_embeds)
-
-            ent_embeds = n_ent_embeds
-            rel_embeds = n_rel_embeds
+            ent_embeds, rel_embeds = self.evolve_step(
+                graph, ent_embeds, rel_embeds
+            )
 
         return ent_embeds, rel_embeds
 
@@ -173,7 +182,10 @@ class REGCN(TkgrModel):
         Returns:
             logits: (num_triplets, num_entities)
         """
-        ent_embeds, rel_embeds = self.evolve(hist_graphs)
+        if self.training:
+            ent_embeds, rel_embeds = self.evolve(hist_graphs)
+        else:
+            pass
         subj_embeds = ent_embeds[subj]
         obj_logit = self.obj_score(subj_embeds, rel_embeds[rel], ent_embeds)
         rel_logit = self.rel_score(subj_embeds, ent_embeds[obj], rel_embeds)
@@ -211,3 +223,14 @@ class REGCN(TkgrModel):
             rel_node_mask.sum(dim=1), node_feats[node_ids], "mean"
         )
         return torch.nan_to_num(rel_embeds, 0)
+
+
+class MultistepREGCN(REGCN):
+    def forward(
+        self,
+        hist_graphs: List[dgl.DGLGraph],
+        subj: torch.Tensor,
+        rel: torch.Tensor,
+        obj: torch.Tensor,
+    ):
+        pass

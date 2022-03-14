@@ -4,6 +4,7 @@ from typing import List
 import dgl
 import torch
 from dgl.udf import EdgeBatch
+from tallow.nn import forwards
 
 from tkgl.models.evokg import RGCN
 
@@ -26,21 +27,81 @@ def group_reduce_nodes(
     reducer: str = "mean",
 ):
     # num_rels = torch.Tensor.size(edge_rel_ids.unique(edge_rel_ids), 0)
-    num_rels = edge_rel_ids.max()
-    # (num_rels, num_nodes)
-    rn_mask = node_feats.new_zeros(
-        num_rels, node_feats.size(0), dtype=torch.bool
-    )
-    src, dst, eids = graph.edges("all")
-    rel_ids = edge_rel_ids[eids]
-    rn_mask[rel_ids, src] = True
-    rn_mask[rel_ids, dst] = True
+    rn_mask = build_r2n_mask(graph, edge_rel_ids)
 
     nids = torch.nonzero(rn_mask)[:, 1]
     rel_emb = dgl.ops.segment_reduce(
         rn_mask.sum(dim=1), node_feats[nids], reducer
     )
     return torch.nan_to_num(rel_emb, 0)
+
+
+def graph_to_triplets(
+    graph: dgl.DGLGraph, ent_embeds: torch.Tensor, rel_embeds: torch.Tensor
+) -> torch.Tensor:
+
+    src, dst, eid = graph.edges("all")
+    subj = graph.ndata["eid"][src]
+    rel = graph.edata["rid"][eid]
+    obj = graph.ndata["eid"][dst]
+    embed_list = [ent_embeds[subj], rel_embeds[rel], ent_embeds[obj]]
+    return torch.stack(embed_list, dim=1)
+
+
+def build_r2n_mask(
+    graph: dgl.DGLGraph,
+    edge_rel_ids: torch.Tensor,
+    num_nodes: int = None,
+    num_rels: int = None,
+):
+    if num_nodes is None:
+        num_nodes = graph.num_nodes()
+    if num_rels is None:
+        num_rels = edge_rel_ids.max()
+
+    rn_mask = torch.zeros(
+        num_rels, num_nodes, dtype=torch.bool, device=graph.device
+    )
+    src, dst, eids = graph.edges("all")
+    rel_ids = edge_rel_ids[eids]
+    rn_mask[rel_ids, src] = True
+    rn_mask[rel_ids, dst] = True
+    return rn_mask
+
+
+def qkv_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qk_mask: torch.Tensor = None,
+):
+    """
+    Arguments:
+        q: (Q, H)
+        k: (KV, H)
+        v: (KV, H)
+        qk_mask: (Q, KV)
+    """
+    d = q.size(-1)
+    s = (q @ k.t()) / torch.sqrt(d)  # (Q, KV)
+    if qk_mask is not None:
+        s.masked_fill_(~qk_mask, float("-inf"))
+    a = s.softmax(s, dim=-1)
+    return a @ v, a
+
+
+def bi_attention(
+    graph: dgl.DGLGraph, nfeats: torch.Tensor, rfeats: torch.Tensor
+):
+    """
+    Arguments:
+        nfeats: (N, H)
+        rfeats: (R, H)
+    """
+    r2n_mask = build_r2n_mask(graph, graph.edata["rid"])
+    n, _ = qkv_attention(nfeats, rfeats, rfeats, r2n_mask.t())
+    r, _ = qkv_attention(rfeats, nfeats, nfeats, r2n_mask)
+    return n, r
 
 
 class MultiRelGraphConv(torch.nn.Module):
@@ -71,7 +132,7 @@ class MultiRelGraphConv(torch.nn.Module):
             nfeats = self._dp(nfeats)
             efeats = self._dp(efeats)
             nfeats, efeats = layer(graph, nfeats, efeats, edge_types)
-        return nfeats, efeats
+        return nfeats
 
     class Layer(torch.nn.Module):
         def __init__(self, inp_sz: int, hid_sz: int):
@@ -106,8 +167,7 @@ class MultiRelGraphConv(torch.nn.Module):
                     edges.dst["h"],
                 ]
                 edges_inp = torch.cat(inp_list, dim=-1)
-                edges_msg = self._linear2(edges_inp)
-                edges.data["msg"] = self._gru(edges_msg, edges.data["h"])
+                edges.data["msg"] = self._linear2(edges_inp)
 
             rel_emb = group_reduce_nodes(graph, nfeats, etype)
             with graph.local_scope():
@@ -120,23 +180,13 @@ class MultiRelGraphConv(torch.nn.Module):
                 # edge msg
                 graph.apply_edges(update_edges)
 
-                self_msg = self._linear3(nfeats)
-                node_feats = torch.rrelu(graph.ndata["msg"] + self_msg)
-                edge_feats = self._gru(graph.edata["msg"], efeats)
+                node_msg = graph.ndata["msg"]
+                edge_msg = graph.edata["msg"]
+
+            node_feats = torch.rrelu(node_msg + self._linear3(nfeats))
+            edge_feats = self._gru(edge_msg, efeats)
 
             return node_feats, edge_feats
-
-
-def graph_to_triplets(
-    graph: dgl.DGLGraph, ent_embeds: torch.Tensor, rel_embeds: torch.Tensor
-) -> torch.Tensor:
-
-    src, dst, eid = graph.edges("all")
-    subj = graph.ndata["eid"][src]
-    rel = graph.edata["rid"][eid]
-    obj = graph.ndata["eid"][dst]
-    embed_list = [ent_embeds[subj], rel_embeds[rel], ent_embeds[obj]]
-    return torch.stack(embed_list, dim=1)
 
 
 class SeqEvo(torch.nn.Module):
@@ -151,17 +201,22 @@ class SeqEvo(torch.nn.Module):
     ) -> None:
         super().__init__()
 
-        self._rgcn = MultiRelGraphConv(
+        self._mrgcn = MultiRelGraphConv(
             hidden_size, hidden_size, num_layers, dropout
         )
-        self._gru = torch.nn.GRU(hidden_size, hidden_size, batch_first=True)
+        self._gru1 = torch.nn.GRUCell(
+            2 * hidden_size, hidden_size, batch_first=True
+        )
+        self._gru2 = torch.nn.GRUCell(
+            2 * hidden_size, hidden_size, batch_first=True
+        )
 
         self._linear1 = torch.nn.Linear(hidden_size, hidden_size)
 
-        self.ent_embeds = torch.nn.Parameter(torch.zeros(num_ents, hidden_size))
-        self.rel_embeds = torch.nn.Parameter(torch.zeros(num_rels, hidden_size))
-        torch.nn.init.xavier_normal_(self.ent_embeds)
-        torch.nn.init.xavier_uniform_(self.rel_embeds)
+        self.ent_emb = torch.nn.Parameter(torch.zeros(num_ents, hidden_size))
+        self.rel_emb = torch.nn.Parameter(torch.zeros(num_rels, hidden_size))
+        torch.nn.init.xavier_normal_(self.ent_emb)
+        torch.nn.init.xavier_uniform_(self.rel_emb)
 
     def forward(
         self,
@@ -171,13 +226,13 @@ class SeqEvo(torch.nn.Module):
         obj: torch.Tensor,
     ):
         bg = dgl.batch(hist_graphs)
-        total_nfeats = self._rgcn(bg, self.ent_embeds[bg.ndata["eid"]])
+        total_nfeats = self._rgcn(bg, self.ent_emb[bg.ndata["eid"]])
         hist_nfeat_list = torch.split_with_sizes(
             total_nfeats, bg.batch_num_nodes().tolist()
         )
         hist_nfeats = torch.stack(hist_nfeat_list, dim=1)
         # (num_ents, hist_len, hidden_size)
-        hist_nhiddens, _ = self._gru(hist_nfeats, self.ent_embeds.unsqueeze(1))
+        hist_nhiddens, _ = self._gru(hist_nfeats, self.ent_emb.unsqueeze(1))
         # hist_gfeats, _ = self._gru(hist_gfeats)
         # transformer_hist_nfeats = forwards.transformer_encoder_forward(
         #     self._transformer_encoder, hist_nfeats
@@ -185,33 +240,30 @@ class SeqEvo(torch.nn.Module):
         # transformer_nfeats = self._linear1(transformer_hist_nfeats[:, -1, :])
 
     def recursive_reasoning(self, hist_graphs: List[dgl.DGLGraph]):
-        ent_embeds = self.ent_embeds
-        rel_embeds = self.rel_embeds
+        ent_emb = self.ent_emb
+        rel_emb = self.rel_emb
         for graph in hist_graphs:
-            node_feats = self._rgcn(graph, ent_embeds)
-            pass
-        pass
+            nfeats = self._mrgcn(
+                graph,
+                ent_emb[graph.ndata["eid"]],
+                rel_emb[graph.edata["rid"]],
+                graph.edata["rid"],
+            )
+            n_emb = nfeats[torch.argsort(graph.ndata["eid"])]
+            r_emb = rel_emb
+            nr_feats, rn_feats = bi_attention(graph, n_emb, r_emb)
+            ent_emb = self._gru1(torch.cat([nr_feats, n_emb], dim=-1), ent_emb)
+            rel_emb = self._gru2(torch.cat([rn_feats, r_emb], dim=-1), rel_emb)
+
+        return ent_emb, rel_emb
 
     def highway_reasoning(self, hist_graphs: List[dgl.DGLGraph]):
         bg = dgl.batch(hist_graphs)
-        total_nfeats = self._rgcn(bg, self.ent_embeds[bg.ndata["eid"]])
+        total_nfeats = self._rgcn(bg, self.ent_emb[bg.ndata["eid"]])
         hist_nfeat_list = torch.split_with_sizes(
             total_nfeats, bg.batch_num_nodes().tolist()
         )
         hist_nfeats = torch.stack(hist_nfeat_list, dim=1)
         # (num_ents, hist_len, hidden_size)
-        hist_nhiddens, _ = self._gru(hist_nfeats, self.ent_embeds.unsqueeze(1))
+        hist_nhiddens, _ = self._gru(hist_nfeats, self.ent_emb.unsqueeze(1))
         pass
-
-
-def generate_square_subsequent_mask(sz: int) -> torch.Tensor:
-    r"""Generate a square mask for the sequence. The masked positions are filled with float('-inf').
-    Unmasked positions are filled with float(0.0).
-    """
-    mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-    mask = (
-        mask.float()
-        .masked_fill(mask == 0, float("-inf"))
-        .masked_fill(mask == 1, float(0.0))
-    )
-    return mask

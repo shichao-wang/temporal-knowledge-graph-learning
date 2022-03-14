@@ -1,9 +1,8 @@
 import abc
 import logging
-from typing import Dict, List, Tuple, Type
+from typing import Callable, List, Tuple, TypedDict
 
 import dgl
-import molurus
 import torch
 from torch.nn import functional as tf
 
@@ -52,6 +51,13 @@ class JointSigmoidLoss(torch.nn.Module):
         return ent_loss * self._alpha + rel_loss * (1 - self._alpha)
 
 
+class TkgrReturns(TypedDict):
+    ent_embeds: torch.Tensor
+    rel_embeds: torch.Tensor
+    obj_logit: torch.Tensor
+    rel_logit: torch.Tensor
+
+
 class TkgrModel(torch.nn.Module):
 
     num_ents: int
@@ -60,6 +66,8 @@ class TkgrModel(torch.nn.Module):
 
     rel_score: RelScoreFunction
     obj_score: NodeScoreFunction
+
+    __call__: Callable[..., TkgrReturns]
 
     @abc.abstractmethod
     def evolve(
@@ -70,19 +78,3 @@ class TkgrModel(torch.nn.Module):
     @classmethod
     def build_criterion(cls, alpha: float):
         return JointLoss(alpha)
-
-
-def build_model(cfg: Dict, **kwargs) -> TkgrModel:
-    model_arch = cfg.pop("arch")
-    model_class: Type[TkgrModel] = molurus.import_get(model_arch)
-
-    if "TemporalRerank" in model_arch:
-        backbone_cfg = cfg.pop("backbone")
-        for k, v in cfg.items():
-            dict.setdefault(backbone_cfg, k, v)
-
-        cfg["backbone"] = build_model(backbone_cfg, **kwargs)
-
-    logger.info(f"Model: {model_class.__name__}")
-    model = molurus.smart_call(model_class, cfg, **kwargs)
-    return model

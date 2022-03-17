@@ -1,13 +1,14 @@
 import argparse
 import os
-import pprint
 
+import molurus
 import torch
-from molurus import config_dict
+from molurus import hierdict
 from tallow import evaluators
-from train_model import build_model, load_tkg_data
 
-import tkgl
+from tkgl.datasets import load_tkg_dataset
+from tkgl.metrics import JointMetric
+from tkgl.models import build_model
 
 
 def main():
@@ -18,14 +19,16 @@ def main():
     assert os.path.exists(ckpt_path)
 
     config_path = os.path.join(os.path.dirname(ckpt_path), "config.yml")
-    cfg = config_dict.parse_file(config_path)
-    datasets, vocabs = load_tkg_data(cfg["data"])
+    cfg = hierdict.load(open(config_path))
+    datasets, vocabs = molurus.smart_call(load_tkg_dataset, cfg["data"])
 
-    model, criterion = build_model(cfg["model"], vocabs)
-    model.load_state_dict(torch.load(ckpt_path)["model"])
-    metric = tkgl.metrics.JointMetric()
-    evaluator = evaluators.Evaluator(model, metric)
-    results = evaluator.execute(datasets)
+    model = build_model(
+        cfg["model"],
+        num_ents=len(vocabs["ent"]),
+        num_rels=len(vocabs["rel"]),
+    )
+    evaluator = evaluators.Evaluator(datasets, JointMetric())
+    results = evaluator.execute(model, torch.load(ckpt_path)["model"])
     print(results.T * 100)
 
 

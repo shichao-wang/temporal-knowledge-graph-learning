@@ -1,16 +1,18 @@
 import logging
 import os
-from typing import Dict
+import typing
+from typing import Dict, Optional, Union
 
 import molurus
 import torch
 from molurus import config_dict
 from molurus.functions import smart_call
+from pandas import DataFrame, Series
 from tallow import backends
 from tallow.backends.grad_clipper import grad_clipper
 from tallow.data.datasets import Dataset
 from tallow.evaluators import Evaluator
-from tallow.trainers import TrainerBuilder, TrainerStateDict
+from tallow.trainers import Trainer, TrainerBuilder, TrainerStateDict, hooks
 
 from .datasets import load_tkg_dataset
 from .metrics import EntMRR, JointMetric
@@ -66,12 +68,43 @@ class TkgrTrial:
             .earlystop(val_data, val_metric, tr_cfg["patient"])
             .build()
         )
-        return trainer.execute(model, train_data, criterion, optimizer)
+        _ = trainer.execute(model, train_data, criterion, optimizer)
+        return retrieve_best_model(trainer)
+
+    @typing.overload
+    def eval_model(
+        self,
+        model: TkgrModel,
+        datasets: Dataset,
+        state_dict: TrainerStateDict,
+    ) -> Series:
+        pass
+
+    @typing.overload
+    def eval_model(
+        self,
+        model: TkgrModel,
+        datasets: Dict[str, Dataset],
+        state_dict: TrainerStateDict,
+    ) -> DataFrame:
+        pass
 
     def eval_model(
-        self, model: TkgrModel, eval_data: Dataset, state_dict: TrainerStateDict
+        self,
+        model: TkgrModel,
+        datasets: Union[Dataset, Dict[str, Dataset]],
+        state_dict: TrainerStateDict,
     ):
         metric = JointMetric()
         model.load_state_dict(state_dict["model"])
-        evaluator = Evaluator({"test": eval_data}, metric)
-        return evaluator.execute(model)
+        if isinstance(datasets, Dataset):
+            datasets = {"test": datasets}
+        evaluator = Evaluator(datasets, metric)
+        return evaluator.execute(model).squeeze()
+
+
+def retrieve_best_model(trainer: Trainer) -> TrainerStateDict:
+    for hook in trainer.hook_mgr:
+        if isinstance(hook, hooks.EarlyStopHook):
+            return hook._disk_mgr.load()
+    raise ValueError()

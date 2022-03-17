@@ -14,9 +14,9 @@ model:
   channels: 50
   dropout: 0.2
   norm_embeds: true
-  alpha: 0.7
 
 training:
+  alpha: 0.7
   patient: 5
   lr: 1.0e-3
   weight_decay: 1.0e-5

@@ -1,4 +1,3 @@
-import copy
 from typing import List
 
 import dgl
@@ -6,16 +5,19 @@ import torch
 
 from tkgl.models.regcn import OmegaRelGraphConv
 from tkgl.models.tkgr_model import TkgrModel
+from tkgl.scores import ConvTransENS
 
 from .rerank import RerankTkgrModel
 
 
-class TemporalRerank(RerankTkgrModel):
+class RelGraphConvRerank(RerankTkgrModel):
     def __init__(
         self,
         backbone: TkgrModel,
         k: int,
         num_layers: int,
+        num_channels: int,
+        kernel_size: int,
         dropout: float,
         finetune: bool,
         pretrained_backbone: str = None,
@@ -25,7 +27,9 @@ class TemporalRerank(RerankTkgrModel):
         self._rgcn = OmegaRelGraphConv(
             self.hidden_size, self.hidden_size, num_layers, dropout
         )
-        self.obj_score = copy.deepcopy(self.backbone.obj_score)
+        self.obj_score = ConvTransENS(
+            self.hidden_size, num_channels, kernel_size, dropout
+        )
 
     def forward(
         self,
@@ -47,9 +51,7 @@ class TemporalRerank(RerankTkgrModel):
             ent_emb[obj_pred_graph.ndata["eid"]],
             rel_emb[obj_pred_graph.edata["rid"]],
         )
-        obj_logit = self.obj_score.forward(
-            node_feats[subj], rel_emb[rel], ent_emb
-        )
+        obj_logit = self.obj_score(node_feats[subj], rel_emb[rel], ent_emb)
         return {
             "obj_logit": obj_logit,
             "obj_logit_orig": obj_logit_orig,

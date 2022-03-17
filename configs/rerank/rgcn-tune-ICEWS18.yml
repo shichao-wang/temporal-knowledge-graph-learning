@@ -1,6 +1,6 @@
 data:
-  data_folder: "./datasets/GDELT"
-  hist_len: 1 
+  data_folder: "./datasets/ICEWS18"
+  hist_len: 6 
   bidirectional: true
   different_unknowns: true
   complement_val_and_test: true
@@ -16,16 +16,28 @@ model:
     channels: 50
     dropout: 0.2
     norm_embeds: true
-  k: 10
+  k: 
+    - 1
+    - 3
+    - 5
+    - 10
+
   num_layers: 2
+  kernel_size: 3
+  num_channels: 50
   dropout: 0.2
-  finetune: true
+  finetune: false
   pretrained_backbone: null
 
-  alpha: 0.7
-  beta: 0.8
 
 training:
+  alpha: 0.7
+  beta: 
+    - 0.1
+    - 0.3
+    - 0.5
+    - 0.7
+    - 0.9
   patient: 5
   lr: 1.0e-3
   weight_decay: 1.0e-5

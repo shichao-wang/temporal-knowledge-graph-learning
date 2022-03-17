@@ -182,10 +182,8 @@ class REGCN(TkgrModel):
         Returns:
             logits: (num_triplets, num_entities)
         """
-        if self.training:
-            ent_embeds, rel_embeds = self.evolve(hist_graphs)
-        else:
-            pass
+        ent_embeds, rel_embeds = self.evolve(hist_graphs)
+
         subj_embeds = ent_embeds[subj]
         obj_logit = self.obj_score(subj_embeds, rel_embeds[rel], ent_embeds)
         rel_logit = self.rel_score(subj_embeds, ent_embeds[obj], rel_embeds)

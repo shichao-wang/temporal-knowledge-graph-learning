@@ -146,7 +146,7 @@ def load_tkg_dataset(
     bidirectional: bool,
     different_unknowns: bool,
     complement_val_and_test: bool,
-    shuffle: bool,
+    shuffle: int,
 ) -> Tuple[Dict[str, ExtrapolateTKGDataset], Dict[str, vocabs.Vocab]]:
     subsets = ("train", "val", "test")
     quadruples: Dict[str, List[Quadruple]] = {}
@@ -198,5 +198,5 @@ def load_tkg_dataset(
             )
             datasets[subset] = dataset
     if shuffle:
-        datasets["train"] = datasets["train"].shuffle()
+        datasets["train"] = datasets["train"].shuffle(seed=shuffle)
     return datasets, vocabs

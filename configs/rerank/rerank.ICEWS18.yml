@@ -7,7 +7,7 @@ data:
   shuffle: true
 
 model:
-  arch: tkgl.models.rerank.TemporalRerank
+  arch: tkgl.models.rerank.RelGraphConvRerank
   backbone: 
     arch: tkgl.models.regcn.REGCN
     hidden_size: 200
@@ -18,6 +18,8 @@ model:
     norm_embeds: true
   k: 10
   num_layers: 2
+  kernel_size: 3
+  channels: 50
   dropout: 0.2
   finetune: false
   pretrained_backbone: null

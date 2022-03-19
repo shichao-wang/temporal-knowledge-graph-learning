@@ -28,29 +28,6 @@ class JointLoss(torch.nn.Module):
         return ent_loss * self._alpha + rel_loss * (1 - self._alpha)
 
 
-class JointSigmoidLoss(torch.nn.Module):
-    def __init__(self, alpha: float):
-        super().__init__()
-        self._alpha = alpha
-
-    def forward(
-        self,
-        obj_logit: torch.Tensor,
-        obj: torch.Tensor,
-        rel_logit: torch.Tensor,
-        rel: torch.Tensor,
-    ):
-        rel_loss = tf.binary_cross_entropy_with_logits(
-            rel_logit, tf.one_hot(rel, rel_logit.size(-1))
-        )
-        ent_loss = tf.binary_cross_entropy_with_logits(
-            obj_logit, tf.one_hot(obj, obj_logit.size(-1))
-        )
-        # rel_loss = tf.cross_entropy(rel_logit, rel)
-        # ent_loss = tf.cross_entropy(obj_logit, obj)
-        return ent_loss * self._alpha + rel_loss * (1 - self._alpha)
-
-
 class TkgrReturns(TypedDict):
     ent_embeds: torch.Tensor
     rel_embeds: torch.Tensor

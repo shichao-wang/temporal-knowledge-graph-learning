@@ -7,17 +7,21 @@ data:
   shuffle: true
 
 model:
-  arch: tkgl.models.regcn.REGCN
+  _class: tkgl.models.regcn.REGCN
   hidden_size: 200
   num_layers: 2
   kernel_size: 3
   channels: 50
   dropout: 0.2
   norm_embeds: true
-  alpha: 0.7
 
 training:
+  criterion:
+    _class: tkgl.models.JointLoss
+    alpha: 0.7
+  optim:
+    _class: torch.optim.Adam
+    lr: 1.0e-3
+    weight_decay: 1.0e-5
   patient: 5
-  lr: 1.0e-3
-  weight_decay: 1.0e-5
-  grad_norm: 1.0
+  grad_clip_norm: 1.0

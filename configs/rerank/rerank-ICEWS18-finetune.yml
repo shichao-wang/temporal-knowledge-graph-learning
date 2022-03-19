@@ -1,0 +1,62 @@
+data:
+  data_folder: "./datasets/ICEWS18"
+  hist_len: 6 
+  bidirectional: true
+  different_unknowns: true
+  complement_val_and_test: true
+  shuffle: true
+
+model:
+  _class: tkgl.models.rerank.RelGraphConvRerank
+  backbone: 
+    _class: tkgl.models.regcn.REGCN
+    hidden_size: 200
+    num_layers: 2
+    kernel_size: 3
+    channels: 50
+    dropout: 0.2
+    norm_embeds: true
+  k: 10
+  num_layers: 2
+  kernel_size: 3
+  num_channels: 50
+  dropout: 0.2
+  finetune: true
+  pretrained_backbone: null
+
+
+training:
+  criterion:
+    _class: "tkgl.models.rerank.RerankLoss"
+    alpha: 0.7
+    beta: 0.8
+  optim:
+    _class: "torch.optim.Adam"
+    lr: 1.0e-3
+    weight_decay: 1.0e-5
+  patient: 5
+  grad_clip_norm: 1.0
+
+hpspace:
+  model.k: 
+    - 1
+    - 10
+    - 1
+  model.num_layers: 
+    - 1
+    - 2
+    - 1
+  training.criterion.beta:
+    - 0.0
+    - 1.0
+    - 0.1
+  training.optim.lr:
+    - 1.0e-5
+    - 5.0e-5
+    - 1.0e-4
+    - 5.0e-4
+    - 1.0e-3
+  # training.criterion.beta: 
+  #   - 0.0
+  #   - 1.0
+

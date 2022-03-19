@@ -1,19 +1,43 @@
+import logging
 import os
+from typing import Dict, Type
 
 import molurus
-from molurus import hierdict
-from tallow import backends
-from tallow.backends.grad_clipper import grad_clipper
+from molurus import hierdict, smart_instaniate
 from tallow.common.seeds import seed_all
 from tallow.data.datasets import Dataset
 from tallow.evaluators import Evaluator
+from tallow.metrics import TorchMetric
 from tallow.trainers import Trainer
-from tallow.trainers.hooks import EarlyStopHook, HookManager
 
-from tkgl import models
 from tkgl.datasets import load_tkg_dataset
-from tkgl.metrics import EntMRR, JointMetric
+from tkgl.metrics import JointMetric
+from tkgl.models.rerank.rerank import RerankTkgrModel
 from tkgl.models.tkgr_model import TkgrModel
+
+logger = logging.getLogger(__name__)
+
+
+def build_model(cfg: hierdict.HierDict, **kwargs) -> TkgrModel:
+    model_cfg = cfg.copy()
+    model_arch = model_cfg.pop("_class")
+    model_class: Type[TkgrModel] = molurus.import_get(model_arch)
+
+    if issubclass(model_class, RerankTkgrModel):
+        backbone_cfg = model_cfg.pop("backbone")
+        for k, v in model_cfg.items():
+            dict.setdefault(backbone_cfg, k, v)
+
+        model_cfg["backbone"] = build_model(backbone_cfg, **kwargs)
+
+    logger.info(f"Model: {model_class.__name__}")
+    model = molurus.smart_call(model_class, model_cfg, **kwargs)
+    return model
+
+
+def build_criterion(cfg: Dict):
+    crit_cfg = cfg.copy()
+    return molurus.smart_instaniate(crit_cfg.pop("_arch"), crit_cfg)
 
 
 def train_model(
@@ -21,37 +45,30 @@ def train_model(
     model: TkgrModel,
     train_data: Dataset,
     val_data: Dataset,
+    metric: TorchMetric,
     tr_cfg: hierdict.HierDict,
 ):
-    seed_all(tr_cfg.get("seed", 1234))
-    os.makedirs(save_folder_path, exist_ok=True)
-    val_metric = EntMRR()
-    backend = molurus.smart_call(backends.auto_select, tr_cfg)
-
-    criterion = molurus.smart_call(model.build_criterion, tr_cfg)
-    optimizer = molurus.smart_instaniate(
-        "torch.optim.Adam",
-        tr_cfg,
+    criterion = smart_instaniate(tr_cfg["criterion"])
+    optimizer = smart_instaniate(
+        tr_cfg["optim"],
         params=(p for p in model.parameters() if p.requires_grad),
     )
-    clipper = molurus.smart_call(grad_clipper, tr_cfg)
-    earlystop = EarlyStopHook(
+    trainer = Trainer(
         save_folder_path,
-        val_data,
-        val_metric,
-        tr_cfg["patient"],
-        backend=backend,
+        earlystop_monitor="e_mrr",
+        earlystop_patient=tr_cfg["patient"],
+        grad_clip_norm=tr_cfg["grad_clip_norm"],
     )
-    hook_mgr = HookManager(earlystop)
-    trainer = Trainer(backend, clipper, hook_mgr=hook_mgr)
-    last_state_dict = trainer.execute(model, train_data, criterion, optimizer)
-    best_state_dict = earlystop._disk_mgr.load()
-    return best_state_dict
+    state_dict = trainer.execute(
+        model, train_data, criterion, optimizer, val_data, metric
+    )
+    return state_dict
 
 
 def validate_and_dump_config(
     save_folder_path: str, cfg: hierdict.HierDict, cfg_file: str = "config.yml"
 ):
+    os.makedirs(save_folder_path, exist_ok=True)
     cfg_path = os.path.join(save_folder_path, cfg_file)
     if not os.path.exists(cfg_path):
         with open(cfg_path, "w") as fp:
@@ -61,30 +78,36 @@ def validate_and_dump_config(
     assert orig_cfg == cfg
 
 
+def train(save_folder_path: str, cfg: hierdict.HierDict) -> float:
+    cfg.setdefault("seed", 1234)
+    validate_and_dump_config(save_folder_path, cfg)
+    seed_all(cfg["seed"])
+    datasets, vocabs = load_tkg_dataset(**cfg["data"])
+    model = smart_instaniate(
+        cfg["model"], num_ents=len(vocabs["ent"]), num_rels=len(vocabs["rel"])
+    )
+    metric = JointMetric()
+    best_state_dict = train_model(
+        save_folder_path,
+        model,
+        datasets["train"],
+        val_data=datasets["val"],
+        metric=metric,
+        tr_cfg=cfg["training"],
+    )
+
+    evaluator = Evaluator(datasets, metric)
+    dataframe = evaluator.execute(model, best_state_dict["model"])
+    print(dataframe * 100)
+    return dataframe["e_mrr"]["val"]
+
+
 def main():
     parser = hierdict.ArgumentParser()
     parser.add_argument("--save-folder-path")
     args = parser.parse_args()
     cfg = hierdict.parse_args(args.cfg, args.overrides)
-
-    os.makedirs(args.save_folder_path, exist_ok=True)
-    validate_and_dump_config(args.save_folder_path, cfg)
-
-    datasets, vocabs = molurus.smart_call(load_tkg_dataset, cfg["data"])
-    model = models.build_model(
-        cfg["model"], num_ents=len(vocabs["ent"]), num_rels=len(vocabs["rel"])
-    )
-    best_state_dict = train_model(
-        args.save_folder_path,
-        model,
-        datasets["train"],
-        val_data=datasets["val"],
-        tr_cfg=cfg["training"],
-    )
-
-    evaluator = Evaluator(datasets, JointMetric())
-    dataframe = evaluator.execute(model, best_state_dict["model"])
-    print(dataframe.T * 100)
+    train(args.save_folder_path, cfg)
 
 
 if __name__ == "__main__":

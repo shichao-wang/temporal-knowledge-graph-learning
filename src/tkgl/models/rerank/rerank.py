@@ -31,10 +31,6 @@ class RerankTkgrModel(torch.nn.Module):
     def hidden_size(self):
         return self.backbone.hidden_size
 
-    @classmethod
-    def build_criterion(cls, alpha: float, beta: float):
-        return RerankLoss(alpha, beta)
-
 
 class RerankLoss(torch.nn.Module):
     def __init__(self, alpha: float, beta: float):

@@ -18,6 +18,7 @@ model:
     norm_embeds: true
   k: 10
   num_layers: 2
+  # num_heads: 4
   kernel_size: 3
   num_channels: 50
   dropout: 0.2
@@ -27,7 +28,7 @@ model:
 
 training:
   criterion:
-    _class: "tkgl.models.RerankLoss"
+    _class: "tkgl.models.JointLoss"
     alpha: 0.7
   optim:
     _class: "torch.optim.Adam"
@@ -37,17 +38,10 @@ training:
   grad_clip_norm: 1.0
 
 hpspace:
-  model.k: 
-    - 1
-    - 10
-    - 1
-  model.num_layers: 
-    - 1
-    - 2
-    - 1
+  model.k: [1,2,3,4,5,6,7,8,9,10]
+  # model.num_heads: [1,4,8]
+  model.num_layers: [1,2,3]
   training.optim.lr:
-    - 1.0e-5
-    - 5.0e-5
     - 1.0e-4
     - 5.0e-4
     - 1.0e-3

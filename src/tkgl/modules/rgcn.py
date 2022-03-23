@@ -1,3 +1,5 @@
+from typing import Callable
+
 import dgl
 import torch
 from dgl.nn.pytorch import RelGraphConv
@@ -11,39 +13,41 @@ class RGCN(torch.nn.Module):
         hidden_size: int,
         num_rels: int,
         num_layers: int,
-        dropout: float,
+        dropout: float = 0.0,
+        activation: Callable[[torch.Tensor], torch.Tensor] = None,
     ):
         super().__init__()
         self._num_rels = num_rels
-        _layers = torch.nn.ModuleList(
+        self._dropout = torch.nn.Dropout(dropout)
+        self._activation = activation
+
+        self._inp_layer = RelGraphConv(
+            input_size,
+            hidden_size,
+            num_rels,
+            self_loop=True,
+        )
+        self._hid_layers = torch.nn.ModuleList(
             [
                 RelGraphConv(
-                    input_size,
+                    hidden_size,
                     hidden_size,
                     num_rels,
-                    dropout=dropout,
                     self_loop=True,
                 )
+                for _ in range(1, num_layers)
             ]
         )
-        for _ in range(1, num_layers):
-            _layers.append(
-                RelGraphConv(
-                    hidden_size,
-                    hidden_size,
-                    num_rels,
-                    dropout=dropout,
-                    self_loop=True,
-                )
-            )
-        self._layers = torch.nn.ModuleList(_layers)
 
     def forward(self, graph: dgl.DGLGraph, node_feats: torch.Tensor):
-        norm = self._compute_norm_coeff(graph)
-        for layer in self._layers:
-            node_feats = layer(
-                graph, node_feats, graph.edata["rid"], norm.unsqueeze(dim=-1)
-            )
+        norm = self._compute_norm_coeff(graph).unsqueeze(dim=-1)
+        nfeats = self._dropout(node_feats)
+        nfeats = self._inp_layer(node_feats)
+        for layer in self._hid_layers:
+            if self._activation:
+                nfeats = self._activation(nfeats)
+            nfeats = self._dropout(nfeats)
+            nfeats = layer(graph, nfeats, graph.edata["rid"], norm)
         return node_feats
 
     def _compute_norm_coeff(self, graph: dgl.DGLGraph) -> torch.Tensor:

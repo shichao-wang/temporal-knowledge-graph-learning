@@ -3,7 +3,7 @@ from typing import List
 import dgl
 import torch
 
-from tkgl.modules import RGCN
+from tkgl.modules.rgcn import RGCN
 
 
 class EvoKg(torch.nn.Module):
@@ -64,7 +64,7 @@ class EvoKg(torch.nn.Module):
             [rel_pred_embed, self.rel_embeds[rel], rel_dembeds[rel]], dim=-1
         )
         ent_logit = self._linear2(obj_pred_embed)
-        return {"obj_logit": ent_logit, "rel_logit": rel_logit}
+        return {"obj_logit": ent_logit * rel_logit, "rel_logit": rel_logit}
 
     def _agg_rel_nodes(self, graph: dgl.DGLGraph, node_feats: torch.Tensor):
         """

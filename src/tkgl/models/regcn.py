@@ -13,16 +13,19 @@ from tkgl.scores import ConvTransENS, ConvTransERS
 
 class OmegaRelGraphConv(nn.Module):
     def __init__(
-        self, input_size: int, hidden_size: int, num_layers: int, dropout: float
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
     ):
         super().__init__()
-        self._inp_layer = self.Layer(input_size, hidden_size)
+        layer = OmegaGraphConvLayer
 
-        _layers = [
-            self.Layer(hidden_size, hidden_size) for _ in range(1, num_layers)
-        ]
+        _layers = [layer(input_size, hidden_size, dropout)]
+        for _ in range(1, num_layers):
+            _layers.append(layer(hidden_size, hidden_size, dropout))
         self._layers = torch.nn.ModuleList(_layers)
-        self._dp = torch.nn.Dropout(dropout)
 
     def forward(
         self,
@@ -36,60 +39,61 @@ class OmegaRelGraphConv(nn.Module):
             ent_embeds: (num_nodes, input_size)
             rel_embeds: (num_edges, input_size)
         """
-        nfeats = self._inp_layer(graph, node_feats, edge_feats)
         for layer in self._layers:
-            nfeats, efeats = self._dp(nfeats), self._dp(edge_feats)
-            nfeats = layer(graph, nfeats, efeats)
+            node_feats = layer(graph, node_feats, edge_feats)
+        return node_feats
 
-        return nfeats
 
-    class Layer(nn.Module):
+class OmegaGraphConvLayer(nn.Module):
+    """
+    Notice:
+    This implementation of RGCN Layer is not equivalent to the one decribed in the paper.
+    In the paper, there is another self-evolve weight matrix(nn.Linear) for those entities do not exist in current graph.
+    We migrate it with `self._loop_linear` here for simplicity.
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, dropout: float):
+        super().__init__()
+        self._linear1 = nn.Linear(input_size, hidden_size, bias=False)
+        self._linear2 = nn.Linear(input_size, hidden_size, bias=False)
+        self._linear3 = nn.Linear(input_size, hidden_size, bias=False)
+        self._dropout = torch.nn.Dropout(dropout)
+        self._activation = torch.nn.RReLU()
+
+    def forward(
+        self,
+        graph: dgl.DGLHeteroGraph,
+        node_feats: torch.Tensor,
+        edge_feats: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Notice:
-        This implementation of RGCN Layer is not equivalent to the one decribed in the paper.
-        In the paper, there is another self-evolve weight matrix(nn.Linear) for those entities do not exist in current graph.
-        We migrate it with `self._loop_linear` here for simplicity.
+        Arguments:
+            graph: dgl's Graph object
+
+        Return:
+            output: (num_nodes, hidden_size)
         """
 
-        def __init__(self, input_size: int, hidden_size: int):
-            super().__init__()
-            self._linear1 = nn.Linear(input_size, hidden_size, bias=False)
-            self._linear2 = nn.Linear(input_size, hidden_size, bias=False)
-            self._linear3 = nn.Linear(input_size, hidden_size, bias=False)
+        def message_fn(edges: EdgeBatch):
+            msg = self._linear1(edges.src["h"] + edges.data["h"])
+            return {"msg": msg}
 
-        def forward(
-            self,
-            graph: dgl.DGLHeteroGraph,
-            node_feats: torch.Tensor,
-            edge_feats: torch.Tensor,
-        ) -> torch.Tensor:
-            """
-            Arguments:
-                graph: dgl's Graph object
+        node_feats = self._dropout(node_feats)
+        edge_feats = self._dropout(edge_feats)
+        with graph.local_scope():
+            graph.ndata["h"], graph.edata["h"] = node_feats, edge_feats
+            graph.update_all(message_fn, dgl.function.mean("msg", "msg"))
+            neigh_msg = graph.ndata["msg"]
 
-            Return:
-                output: (num_nodes, hidden_size)
-            """
+        self_msg = self._linear2(node_feats)
+        isolate_nids = torch.masked_select(
+            torch.arange(0, graph.number_of_nodes()),
+            (graph.in_degrees() == 0),
+        )
+        iso_msg = self._linear3(node_feats)
+        self_msg[isolate_nids] = iso_msg[isolate_nids]
 
-            def message_fn(edges: EdgeBatch):
-                msg = self._linear1(edges.src["h"] + edges.data["h"])
-                return {"msg": msg}
-
-            with graph.local_scope():
-                graph.ndata["h"], graph.edata["h"] = node_feats, edge_feats
-                graph.update_all(message_fn, dgl.function.mean("msg", "msg"))
-                neigh_msg = graph.ndata["msg"]
-
-            self_msg = self._linear2(node_feats)
-            isolate_nids = torch.masked_select(
-                torch.arange(0, graph.number_of_nodes()),
-                (graph.in_degrees() == 0),
-            )
-            iso_msg = self._linear3(node_feats)
-            self_msg[isolate_nids] = iso_msg[isolate_nids]
-
-            node_feats = torch.rrelu(neigh_msg + self_msg)
-            return node_feats
+        return self._activation(neigh_msg + self_msg)
 
 
 class REGCN(TkgrModel):
@@ -221,14 +225,3 @@ class REGCN(TkgrModel):
             rel_node_mask.sum(dim=1), node_feats[node_ids], "mean"
         )
         return torch.nan_to_num(rel_embeds, 0)
-
-
-class MultistepREGCN(REGCN):
-    def forward(
-        self,
-        hist_graphs: List[dgl.DGLGraph],
-        subj: torch.Tensor,
-        rel: torch.Tensor,
-        obj: torch.Tensor,
-    ):
-        pass

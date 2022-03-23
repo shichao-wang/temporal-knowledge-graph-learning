@@ -49,6 +49,9 @@ class EntMRR(MRR):
     def update(self, obj_logit: torch.Tensor, obj: torch.Tensor) -> None:
         return super().update(logit=obj_logit, target=obj)
 
+    def compute(self):
+        return {"e_mrr": super().compute()}
+
 
 class JointMetric(torchmetrics.Metric):
     ent_ranks: torch.Tensor

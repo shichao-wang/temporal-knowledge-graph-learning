@@ -1,4 +1,6 @@
 import os
+import re
+from asyncio.log import logger
 from typing import Callable, List, Mapping
 
 import optuna
@@ -53,35 +55,41 @@ class OptunaTuner:
 def suggest_cfg(
     base_cfg: hierdict.HierDict, trial: optuna.Trial, hp_space: Mapping
 ):
-    def suggest(k: str):
-        if isinstance(hp_space[k], List) and len(hp_space[k]) > 3:
-            return trial.suggest_categorical(k, hp_space[k])
-        if isinstance(base_cfg[k], str):
-            return trial.suggest_categorical(k, hp_space[k])
-
-        low, high, step = hp_space[k]
-        if isinstance(base_cfg[k], float):
-            return trial.suggest_float(k, low, high, step=step)
-        if isinstance(base_cfg[k], int):
-            return trial.suggest_int(k, low, high, step)
-        raise ValueError()
-
     cfg = base_cfg.copy()
     for key in hp_space:
-        cfg[key] = suggest(key)
+        cfg[key] = trial.suggest_categorical(key, hp_space[key])
     return cfg
+
+
+TIME_RE = re.compile(r"^(?P<num>\d+)(?P<unit>[dhm]$)")
+
+UNIT_SECONDS = {"m": 60, "h": 60 * 60, "d": 24 * 60 * 60}
+
+
+def parse_timestr(time_string: str):
+    matches = TIME_RE.match(time_string)
+    if matches is None:
+        raise ValueError()
+    number, unit = matches.group("num", "unit")
+    return int(float(number) * UNIT_SECONDS[unit])
 
 
 def main():
     parser = hierdict.ArgumentParser()
     parser.add_argument("--save-folder-path")
-    parser.add_argument("--num-trials", default=20)
+    parser.add_argument("--num-trials", default=None, required=False)
+    parser.add_argument("--run-time", default=None, required=False)
     args = parser.parse_args()
     base_cfg = hierdict.parse_args(args.cfg, args.overrides)
     hpspace = base_cfg.pop("hpspace")
 
+    num_seconds = None
+    if args.run_time is not None:
+        num_seconds = parse_timestr(args.run_time)
+        logger.info("Run for %s (%d seconds)", args.run_time, num_seconds)
+
     tuner = OptunaTuner(args.save_folder_path, train, base_cfg, hpspace)
-    best_trial = tuner.execute(args.num_trials)
+    best_trial = tuner.execute(args.num_trials, num_seconds)
     print(best_trial)
 
 

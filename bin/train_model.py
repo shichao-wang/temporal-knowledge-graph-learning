@@ -11,7 +11,7 @@ from tallow.metrics import TorchMetric
 from tallow.trainers import Trainer
 
 from tkgl.datasets import load_tkg_dataset
-from tkgl.metrics import JointMetric
+from tkgl.metrics import EntMRR, JointMetric
 from tkgl.models.rerank.rerank import RerankTkgrModel
 from tkgl.models.tkgr_model import TkgrModel
 
@@ -35,11 +35,6 @@ def build_model(cfg: hierdict.HierDict, **kwargs) -> TkgrModel:
     return model
 
 
-def build_criterion(cfg: Dict):
-    crit_cfg = cfg.copy()
-    return molurus.smart_instaniate(crit_cfg.pop("_arch"), crit_cfg)
-
-
 def train_model(
     save_folder_path: str,
     model: TkgrModel,
@@ -48,6 +43,7 @@ def train_model(
     metric: TorchMetric,
     tr_cfg: hierdict.HierDict,
 ):
+    print(tr_cfg)
     criterion = smart_instaniate(tr_cfg["criterion"])
     optimizer = smart_instaniate(
         tr_cfg["optim"],
@@ -86,7 +82,7 @@ def train(save_folder_path: str, cfg: hierdict.HierDict) -> float:
     model = smart_instaniate(
         cfg["model"], num_ents=len(vocabs["ent"]), num_rels=len(vocabs["rel"])
     )
-    metric = JointMetric()
+    metric = EntMRR()
     best_state_dict = train_model(
         save_folder_path,
         model,

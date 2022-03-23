@@ -1,0 +1,23 @@
+data:
+  data_folder: "./datasets/ICEWS18"
+  hist_len: 6 
+  bidirectional: true
+  different_unknowns: true
+  complement_val_and_test: true
+  shuffle: true
+
+model:
+  _class: tkgl.models.hiertkgr.HighwayHierTkgr
+  hidden_size: 200
+  num_layers: 2
+  dropout: 0.2
+
+training:
+  criterion:
+    _class: tkgl.models.EntLoss
+  optim:
+    _class: torch.optim.Adam
+    lr: 1.0e-3
+    weight_decay: 1.0e-5
+  patient: 5
+  grad_clip_norm: 1.0

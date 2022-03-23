@@ -28,30 +28,25 @@ class JointLoss(torch.nn.Module):
         return ent_loss * self._alpha + rel_loss * (1 - self._alpha)
 
 
-class TkgrReturns(TypedDict):
-    ent_embeds: torch.Tensor
-    rel_embeds: torch.Tensor
-    obj_logit: torch.Tensor
-    rel_logit: torch.Tensor
+class EntLoss(torch.nn.Module):
+    def forward(self, obj_logit: torch.Tensor, obj: torch.Tensor):
+        ent_loss = tf.cross_entropy(obj_logit, obj)
+        return ent_loss
 
 
 class TkgrModel(torch.nn.Module):
+    def __init__(
+        self,
+        num_ents: int,
+        num_rels: int,
+        hidden_size: int,
+    ):
+        super().__init__()
+        self.num_ents = num_ents
+        self.num_rels = num_rels
+        self.hidden_size = hidden_size
+        self.ent_emb = torch.nn.Parameter(torch.empty(num_ents, hidden_size))
+        self.rel_emb = torch.nn.Parameter(torch.empty(num_rels, hidden_size))
 
-    num_ents: int
-    num_rels: int
-    hidden_size: int
-
-    rel_score: RelScoreFunction
-    obj_score: NodeScoreFunction
-
-    __call__: Callable[..., TkgrReturns]
-
-    @abc.abstractmethod
-    def evolve(
-        self, hist_graphs: List[dgl.DGLGraph]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError()
-
-    @classmethod
-    def build_criterion(cls, alpha: float):
-        return JointLoss(alpha)
+        torch.nn.init.xavier_uniform_(self.ent_emb)
+        torch.nn.init.xavier_uniform_(self.rel_emb)

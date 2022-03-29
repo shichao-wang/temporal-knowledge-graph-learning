@@ -9,17 +9,16 @@ from torch import nn
 def edge_neighbor_subgraph(graph: dgl.DGLGraph, ent_ids: torch.Tensor):
     def is_adj(edges: EdgeBatch):
         dst_mask = torch.sum(
-            edges.dst["ent_id"] == ent_ids[..., None], dim=0, dtype=torch.bool
+            edges.dst["eid"] == ent_ids[..., None], dim=0, dtype=torch.bool
         )
         src_mask = torch.sum(
-            edges.src["ent_id"] == ent_ids[..., None], dim=0, dtype=torch.bool
+            edges.src["eid"] == ent_ids[..., None], dim=0, dtype=torch.bool
         )
         mask = torch.bitwise_or(dst_mask, src_mask)
         return mask
 
-    cgraph = graph.cpu()
     edges = graph.filter_edges(is_adj)
-
+    cgraph = graph.cpu()
     sg = dgl.edge_subgraph(
         cgraph, torch.Tensor.cpu(edges), relabel_nodes=False
     ).to(graph.device)
@@ -27,7 +26,7 @@ def edge_neighbor_subgraph(graph: dgl.DGLGraph, ent_ids: torch.Tensor):
 
 
 def node_neighbor_subgraph(graph: dgl.DGLGraph, ent_ids: torch.Tensor):
-    node_ids = torch.nonzero(graph.ndata["ent_id"] == ent_ids[..., None])[:, -1]
+    node_ids = torch.nonzero(graph.ndata["eid"] == ent_ids[..., None])[:, -1]
     adj_mat: torch.Tensor = torch.Tensor.to_dense(graph.adj())
     degrees = torch.sum(adj_mat[node_ids, :] + adj_mat[:, node_ids].t(), dim=0)
     degrees[node_ids] += 1

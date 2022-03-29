@@ -4,6 +4,8 @@ import operator
 import os
 from functools import reduce
 
+import numpy
+
 import tkgl
 
 logging.getLogger(__name__)
@@ -12,22 +14,24 @@ logging.getLogger(__name__)
 def count_file(dfile: str):
     assert os.path.exists(dfile)
 
-    quads = tkgl.datasets.load_quadruples(dfile, bidirectional=False)
-    temporal_quads = tkgl.datasets.groupby_temporal(quads)
+    total_quads = tkgl.datasets.load_txt_quadruplets(dfile)
+    tquads = tkgl.datasets.groupby_temporal(total_quads)
 
-    obj_sets = {"subj": set(), "rel": set(), "obj": set(), "mmt": set()}
-    for quad in quads:
-        for field in ["subj", "rel", "obj", "mmt"]:
-            obj_sets[field].add(quad[field])
-    ent_set = obj_sets["subj"] | obj_sets["obj"]
-    return {
-        "quads": quads,
-        "ent": ent_set,
-        **obj_sets,
-    }
+    num_ent_list = []
+    num_rel_list = []
+    for quads in tquads:
+        tents = numpy.concatenate((quads[:, 0], quads[:, 2]))
+        trels = quads[:, 1]
+        num_ent_list.append(len(numpy.unique(tents)))
+        num_rel_list.append(len(numpy.unique(trels)))
+
+    avg_ents = numpy.mean(num_ent_list)
+    avg_rels = numpy.mean(num_rel_list) * 2
+    print("# avg ent %.6f" % avg_ents)
+    print("# avg rel %.6f" % avg_rels)
 
 
-subsets = ("train", "val", "test")
+datafiles = {"train": "train.txt", "valid": "valid.txt", "test": "test.txt"}
 
 
 def main():
@@ -37,31 +41,10 @@ def main():
 
     data_folder = args.data_folder
     assert os.path.exists(data_folder)
-    results = {}
-    for subset in subsets:
-        data_file = subset + ".tsv"
+    for subset, data_file in datafiles.items():
         data_path = os.path.join(data_folder, data_file)
-        subset_results = count_file(data_path)
-        print(f"Count {subset}")
-        num_edges = len(subset_results["quads"])
-        print(f"#Edges: {num_edges}")
-        num_entities = len(subset_results["ent"])
-        print(f"#Entities: {num_entities}")
-        num_relations = len(subset_results["rel"])
-        print(f"#Relations: {num_relations}")
-        num_histories = len(subset_results["mmt"])
-        print(f"#History: {num_histories}")
-        results[subset] = subset_results
-
-    print("Total: ")
-    num_edges = sum(len(results[s]["quads"]) for s in subsets)
-    print(f"#Edges: {num_edges}")
-    ent_set = reduce(operator.or_, (results[s]["ent"] for s in subsets), set())
-    num_entities = len(ent_set)
-    print(f"#Entities: {num_entities}")
-    rel_set = reduce(operator.or_, (results[s]["rel"] for s in subsets), set())
-    num_relations = len(rel_set)
-    print(f"#Relations: {num_relations}")
+        print(subset)
+        count_file(data_path)
 
 
 if __name__ == "__main__":

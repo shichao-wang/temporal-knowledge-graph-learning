@@ -1,9 +1,8 @@
 import logging
 import os
-from typing import Dict, Type
 
 import molurus
-from molurus import hierdict, smart_instaniate
+from molurus import hierdict
 from tallow.common.seeds import seed_all
 from tallow.data.datasets import Dataset
 from tallow.evaluators import Evaluator
@@ -12,27 +11,9 @@ from tallow.trainers import Trainer
 
 from tkgl.datasets import load_tkg_dataset
 from tkgl.metrics import EntMRR, JointMetric
-from tkgl.models.rerank.rerank import RerankTkgrModel
 from tkgl.models.tkgr_model import TkgrModel
 
 logger = logging.getLogger(__name__)
-
-
-def build_model(cfg: hierdict.HierDict, **kwargs) -> TkgrModel:
-    model_cfg = cfg.copy()
-    model_arch = model_cfg.pop("_class")
-    model_class: Type[TkgrModel] = molurus.import_get(model_arch)
-
-    if issubclass(model_class, RerankTkgrModel):
-        backbone_cfg = model_cfg.pop("backbone")
-        for k, v in model_cfg.items():
-            dict.setdefault(backbone_cfg, k, v)
-
-        model_cfg["backbone"] = build_model(backbone_cfg, **kwargs)
-
-    logger.info(f"Model: {model_class.__name__}")
-    model = molurus.smart_call(model_class, model_cfg, **kwargs)
-    return model
 
 
 def train_model(
@@ -44,8 +25,8 @@ def train_model(
     tr_cfg: hierdict.HierDict,
 ):
     print(tr_cfg)
-    criterion = smart_instaniate(tr_cfg["criterion"])
-    optimizer = smart_instaniate(
+    criterion = molurus.smart_instantiate(tr_cfg["criterion"])
+    optimizer = molurus.smart_instantiate(
         tr_cfg["optim"],
         params=(p for p in model.parameters() if p.requires_grad),
     )
@@ -79,7 +60,7 @@ def train(save_folder_path: str, cfg: hierdict.HierDict) -> float:
     validate_and_dump_config(save_folder_path, cfg)
     seed_all(cfg["seed"])
     datasets, vocabs = load_tkg_dataset(**cfg["data"])
-    model = smart_instaniate(
+    model = molurus.smart_instantiate(
         cfg["model"], num_ents=len(vocabs["ent"]), num_rels=len(vocabs["rel"])
     )
     metric = EntMRR()
@@ -87,7 +68,7 @@ def train(save_folder_path: str, cfg: hierdict.HierDict) -> float:
         save_folder_path,
         model,
         datasets["train"],
-        val_data=datasets["val"],
+        val_data=datasets["valid"],
         metric=metric,
         tr_cfg=cfg["training"],
     )
@@ -95,7 +76,7 @@ def train(save_folder_path: str, cfg: hierdict.HierDict) -> float:
     evaluator = Evaluator(datasets, metric)
     dataframe = evaluator.execute(model, best_state_dict["model"])
     print(dataframe * 100)
-    return dataframe["e_mrr"]["val"]
+    return dataframe["e_mrr"]["valid"]
 
 
 def main():

@@ -1,12 +1,7 @@
-import abc
 import logging
-from typing import Callable, List, Tuple, TypedDict
 
-import dgl
 import torch
 from torch.nn import functional as tf
-
-from tkgl.scores import NodeScoreFunction, RelScoreFunction
 
 logger = logging.getLogger(__name__)
 
@@ -48,5 +43,7 @@ class TkgrModel(torch.nn.Module):
         self.ent_emb = torch.nn.Parameter(torch.empty(num_ents, hidden_size))
         self.rel_emb = torch.nn.Parameter(torch.empty(num_rels, hidden_size))
 
-        torch.nn.init.xavier_uniform_(self.ent_emb)
-        torch.nn.init.xavier_uniform_(self.rel_emb)
+        torch.nn.init.normal_(self.ent_emb)
+        torch.nn.init.xavier_normal_(self.rel_emb)
+        # torch.nn.init.normal_(self.ent_emb)
+        # torch.nn.init.xavier_normal_(self.rel_emb)

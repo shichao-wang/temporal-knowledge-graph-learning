@@ -4,7 +4,9 @@ from typing import Callable, List, Tuple
 import dgl
 import torch
 from dgl.udf import EdgeBatch
-from tallow.nn import forwards
+from numpy import tri
+from tallow.nn import forwards, positional_encoding
+from torch.nn import functional as f
 
 from tkgl.convtranse import ConvTransE
 from tkgl.models.regcn import OmegaRelGraphConv
@@ -93,17 +95,16 @@ class MultiRelGraphConv(torch.nn.Module):
         input_sizse: int,
         hidden_size: int,
         num_layers: int,
-        dropout: float = 0.0,
-        activation: Callable[[torch.Tensor], torch.Tensor] = torch.tanh,
+        dropout: float,
     ):
         super().__init__()
         layer = MultiRelGraphLayer
-        self._inp_layer = layer(input_sizse, hidden_size, activation, dropout)
-        self._layers = torch.nn.ModuleList(
-            [
-                layer(hidden_size, hidden_size, activation, dropout)
-                for _ in range(1, num_layers)
-            ]
+        _layers = [layer(input_sizse, hidden_size, dropout)]
+        for _ in range(1, num_layers):
+            _layers.append(layer(hidden_size, hidden_size, dropout))
+        self._layers = torch.nn.ModuleList(_layers)
+        self._linear = torch.nn.Linear(
+            hidden_size * (1 + num_layers), hidden_size
         )
 
     __call__: Callable[
@@ -114,7 +115,7 @@ class MultiRelGraphConv(torch.nn.Module):
             torch.Tensor,
             torch.LongTensor,
         ],
-        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
     ]
 
     def forward(
@@ -122,28 +123,24 @@ class MultiRelGraphConv(torch.nn.Module):
         graph: dgl.DGLGraph,
         node_feats: torch.Tensor,
         edge_feats: torch.Tensor,
-        edge_types: torch.Tensor,
     ):
-        nfeats = self._inp_layer(graph, node_feats, edge_feats, edge_types)
+        msg_box = [node_feats]
         for layer in self._layers:
-            nfeats = layer(graph, nfeats, edge_feats, edge_types)
-        return nfeats
+            neighbor_msg = layer(graph, msg_box[-1], edge_feats)
+            msg_box.append(neighbor_msg)
+
+        multihop_neighbor = torch.cat(msg_box, dim=-1)
+        return self._linear(multihop_neighbor)
 
 
 class MultiRelGraphLayer(torch.nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        activation: Callable[[torch.Tensor], torch.Tensor] = torch.tanh,
-        dropout: float = 0.0,
-    ):
+    def __init__(self, input_size: int, hidden_size: int, dropout: float = 0.0):
         super().__init__()
-        self._linear1 = torch.nn.Linear(3 * input_size, hidden_size)
-        self._linear2 = torch.nn.Linear(3 * input_size, hidden_size)
-        self._gru = torch.nn.GRUCell(hidden_size, hidden_size)
-        self._activation = activation
+        self._linear1 = torch.nn.Linear(2 * input_size, hidden_size)
+        self._linear2 = torch.nn.Linear(input_size, hidden_size)
+        self._linear3 = torch.nn.Linear(input_size, hidden_size)
         self._dropout = torch.nn.Dropout(dropout)
+        self._activation = torch.nn.RReLU()
 
     def forward(
         self,
@@ -152,11 +149,7 @@ class MultiRelGraphLayer(torch.nn.Module):
         edge_feats: torch.Tensor,
     ):
         def message_fn(edges: EdgeBatch):
-            inp_list = [
-                edges.src["h"],
-                edges.data["h"],
-            ]
-            msg_inp = torch.cat(inp_list, dim=-1)
+            msg_inp = torch.cat([edges.src["h"], edges.data["h"]], dim=-1)
             msg = self._linear1(msg_inp)
             return {"msg": msg}
 
@@ -169,8 +162,12 @@ class MultiRelGraphLayer(torch.nn.Module):
             graph.update_all(message_fn, dgl.function.mean("msg", "msg"))
 
             node_msg = graph.ndata["msg"]
+        node_feats = node_msg
 
-        return self._activation(node_msg + node_feats)
+        self_msg = self._linear2(node_feats)
+        node_feats = node_feats + self_msg
+
+        return self._activation(node_feats)
 
 
 class HighwayHierTkgr(TkgrModel):
@@ -183,12 +180,17 @@ class HighwayHierTkgr(TkgrModel):
         dropout: float,
     ):
         super().__init__(num_ents, num_rels, hidden_size)
-        self.mrgcn = RelGat(hidden_size, hidden_size, num_layers, dropout)
-        self.gru1 = torch.nn.GRU(hidden_size, hidden_size, batch_first=False)
-        self.gru2 = torch.nn.GRU(hidden_size, hidden_size, batch_first=False)
-        self.gru3 = torch.nn.GRU(hidden_size, hidden_size, batch_first=False)
-        self.linear1 = torch.nn.Linear(hidden_size, hidden_size)
-        self.convtranse = ConvTransE(hidden_size, 3, 50, 3, dropout)
+        self.mrgcn = MultiRelGraphConv(
+            hidden_size, hidden_size, num_layers, dropout
+        )
+        self.transformer_encoder = torch.nn.TransformerEncoder(
+            torch.nn.TransformerEncoderLayer(hidden_size, 4, dropout=dropout),
+            num_layers=1,
+        )
+        self.slinear = torch.nn.Linear(hidden_size, hidden_size)
+        self.ssa = StructuredSA(hidden_size, 4, reduction="concat")
+        self.qlinear = torch.nn.Linear(2 * hidden_size, hidden_size)
+        self.convtranse = ConvTransE(hidden_size, 2, 50, 3, dropout)
 
     def forward(
         self,
@@ -196,73 +198,66 @@ class HighwayHierTkgr(TkgrModel):
         subj: torch.Tensor,
         rel: torch.Tensor,
     ):
+        ent_emb = f.normalize(self.ent_emb)
+        rel_emb = f.normalize(self.rel_emb)
         bg = dgl.batch(hist_graphs)
-        total_nfeats: torch.Tensor = self.mrgcn(
-            bg, self.ent_emb[bg.ndata["eid"]], self.rel_emb[bg.edata["rid"]]
+        total_neighbor_emb = self.mrgcn(
+            bg, ent_emb[bg.ndata["eid"]], rel_emb[bg.edata["rid"]]
         )
-        hist_num_nodes = bg.batch_num_nodes().tolist()
-        hist_nfeats = torch.stack(
-            torch.split_with_sizes(total_nfeats, hist_num_nodes),
+        # sf means seqlen first
+        neighbor_emb_lf = torch.stack(
+            torch.split_with_sizes(
+                total_neighbor_emb, bg.batch_num_nodes().tolist()
+            ),
             dim=0,
         )
-        hist_ent_embs, ent_emb = self.gru1(
-            hist_nfeats, self.ent_emb.unsqueeze(0)
+        seq_len = len(hist_graphs)
+        mask = torch.triu(
+            neighbor_emb_lf.new_ones((seq_len, seq_len), dtype=torch.bool)
         )
-        queries = ent_emb[subj] + self.rel_emb[rel]
+        hist_ent_emb = self.transformer_encoder(
+            hist_ent_emb + positional_encoding(hist_ent_emb),
+            mask=~mask,
+        )
+        hist_ent_emb = torch.transpose(hist_ent_emb, 0, 1)
 
-        total_trips = self.linear1(
-            graph_to_triplets(bg, self.ent_emb, self.rel_emb).flatten(-2)
-        )
-        # (Q, T)
-        trip_scores = queries @ total_trips.t()
-        trip_weights = dgl.ops.segment_softmax(
-            bg.batch_num_edges(), trip_scores.t()
-        ).t()
-        # (Q, T, H)
-        x = torch.unsqueeze(trip_weights, dim=-1) * total_trips
-        hist_trip_hidden = dgl.ops.segment_reduce(
-            bg.batch_num_nodes(), torch.transpose(x, 0, 1)
-        )
-        _, trip_hidden = self.gru2(hist_trip_hidden)
-
-        # （L, Q, N)
-        hist_glob_scores = queries @ hist_ent_embs.transpose(-1, -2)
-        hist_glob_weights = torch.softmax(hist_glob_scores, dim=-1)
-        hist_glob_hidden = hist_glob_weights @ hist_ent_embs
-        _, glob_hidden = self.gru3(hist_glob_hidden)
-
-        pred_inp = torch.stack(
-            [ent_emb[subj], self.rel_emb[rel], trip_hidden, glob_hidden], dim=1
-        )
-        obj_logit = self.convtranse(pred_inp, ent_emb)
+        evolve_ent_emb, _ = self.ssa(hist_ent_emb)
+        q = torch.stack([evolve_ent_emb[subj], self.rel_emb[rel]], dim=1)
+        obj_logit = self.convtranse(q) @ evolve_ent_emb.t()
         return {"obj_logit": obj_logit}
 
 
-class HierTKGR(TkgrModel):
+class HierTkgr(TkgrModel):
     def __init__(
         self,
         num_ents: int,
         num_rels: int,
         hidden_size: int,
-        num_layers: int,
         dropout: float,
+        rgcn_num_layers: int,
+        rgcn_self_loop: bool,
     ) -> None:
         super().__init__(num_ents, num_rels, hidden_size)
 
-        self._mrgcn = RelGat(
+        self._rnn1 = torch.nn.GRUCell(2 * hidden_size, hidden_size)
+        self._mrgcn = OmegaRelGraphConv(
             hidden_size,
             hidden_size,
-            num_layers=num_layers,
+            num_layers=rgcn_num_layers,
+            self_loop=rgcn_self_loop,
             dropout=dropout,
         )
+
         self._linear1 = torch.nn.Linear(hidden_size, hidden_size)
         self._linear2 = torch.nn.Linear(3 * hidden_size, hidden_size)
-        self._linear3 = torch.nn.Linear(hidden_size, hidden_size)
-        self._linear4 = torch.nn.Linear(hidden_size, hidden_size)
-        self._rnn1 = torch.nn.GRU(hidden_size, hidden_size, batch_first=True)
-        self._rnn2 = torch.nn.GRU(hidden_size, hidden_size, batch_first=True)
+        self._linear3 = torch.nn.Linear(2 * hidden_size, hidden_size)
+        self._linear4 = torch.nn.Linear(2 * hidden_size, hidden_size)
+        self._linear5 = torch.nn.Linear(hidden_size, hidden_size)
+        self._linear6 = torch.nn.Linear(hidden_size, hidden_size)
+        self._rnn2 = torch.nn.GRU(hidden_size, hidden_size)
+        self._rnn3 = torch.nn.GRU(hidden_size, hidden_size)
 
-        self.convtranse = ConvTransE(hidden_size, 4, 50, 3, dropout)
+        self.convtranse = ConvTransE(hidden_size, 2, 50, 3, dropout)
 
     def forward(
         self,
@@ -271,29 +266,33 @@ class HierTKGR(TkgrModel):
         rel: torch.Tensor,
         # obj: torch.Tensor,
     ):
-        ent_emb = self.ent_emb
-        rel_emb = self.rel_emb
+        ent_emb = f.normalize(self.ent_emb)
+        rel_emb = f.normalize(self.rel_emb)
         hist_trip_list = []
         hist_global_list = []
         for graph in hist_graphs:
+            node_rel_emb = group_reduce_nodes(
+                graph, ent_emb, graph.edata["rid"], self.num_ents, self.num_rels
+            )
+            gru_inputs = torch.cat([node_rel_emb, self.rel_emb], dim=-1)
+            rel_emb = self._rnn1(gru_inputs, rel_emb)
+            rel_emb = f.normalize(rel_emb)
+
             edge_feats = rel_emb[graph.edata["rid"]]
             node_feats = self._mrgcn(graph, ent_emb, edge_feats)
-            u = torch.sigmoid(self._linear1(ent_emb))
-            ent_emb = ent_emb + u * (node_feats - ent_emb)
+            node_feats = f.normalize(node_feats)
+            u = torch.sigmoid(self._linear1(node_feats))
+            ent_emb = f.normalize(ent_emb + u * (node_feats - ent_emb))
 
-            # queries = self._linear3(
-            #     torch.cat([ent_emb[subj], rel_emb[rel]], dim=-1)
-            # )
-            queries = ent_emb[subj] + rel_emb[rel]
+            queries = torch.cat([ent_emb[subj], rel_emb[rel]], dim=-1)
             # semantic
-            triples = self._linear2(
-                graph_to_triplets(graph, ent_emb, rel_emb).flatten(-2)
-            )
-
-            trip_weights = torch.softmax(
+            triples = graph_to_triplets(graph, ent_emb, rel_emb)
+            triples = self._linear2(triples.view(triples.size(0), -1))
+            # trip_v = triples[:, 2]
+            weights = torch.softmax(
                 self._linear3(queries) @ triples.t(), dim=-1
             )
-            trip_hidden = trip_weights @ triples
+            trip_hidden = weights @ triples
 
             glob_weights = torch.softmax(
                 self._linear4(queries) @ ent_emb.t(), dim=-1
@@ -303,29 +302,42 @@ class HierTKGR(TkgrModel):
             hist_trip_list.append(trip_hidden)
             hist_global_list.append(glob_hidden)
 
-        hist_trip = torch.stack(hist_trip_list, dim=1)
-        _, triplet_hidden = forwards.rnn_forward(self._rnn1, hist_trip)
+        hist_trip = torch.stack(hist_trip_list, dim=0)
+        hist_trip_hidden, _ = self._rnn2(hist_trip)
 
-        hist_global = torch.stack(hist_global_list, dim=1)
-        _, global_hidden = forwards.rnn_forward(self._rnn2, hist_global)
+        hist_global = torch.stack(hist_global_list, dim=0)
+        hist_global_hidden, _ = self._rnn3(hist_global)
 
-        pred_inp = torch.stack(
-            [
-                ent_emb[subj],
-                rel_emb[rel],
-                triplet_hidden,
-                global_hidden,
-            ],
-            dim=1,
-        )
-        obj_logit = self.convtranse(pred_inp, ent_emb)
+        pred_inp = torch.stack([ent_emb[subj], rel_emb[rel]], dim=1)
+        # obj_logit = self.convtranse(pred_inp) @ ent_emb.t()
+        trip_logit = self._linear5(hist_trip_hidden[-1]).relu() @ ent_emb.t()
+        glob_logit = self._linear6(hist_global_hidden[-1]).relu() @ ent_emb.t()
 
-        return {"obj_logit": obj_logit}
+        # bg = dgl.batch(hist_graphs)
+        # src, dst, eid = bg.edges("all")
+        # # (Q, E)
+        # subj_mask = subj.unsqueeze(dim=-1) == bg.ndata["eid"][src]
+        # rel_mask = rel.unsqueeze(dim=-1) == bg.edata["rid"][eid]
+        # mask = torch.bitwise_and(subj_mask, rel_mask)
+
+        # hist_obj = ent_emb[bg.ndata["eid"][dst]]
+        # hist_obj = ent_emb
+        # q = self._linear4(torch.cat([ent_emb[subj], rel_emb[rel]], dim=-1))
+        # scores = q @ hist_obj.t()
+        # # scores = torch.masked_fill(scores, ~mask, -999999)
+        # weights = torch.softmax(scores, dim=-1)
+        # hist_obj_agg = weights @ hist_obj
+        # hist_obj_logit = self._linear5(hist_obj_agg).relu() @ ent_emb.t()
+        return {"obj_logit": trip_logit + glob_logit}
 
 
 class StructuredSA(torch.nn.Module):
     def __init__(
-        self, input_size: int, num_heads: int, internal_size: int = None
+        self,
+        input_size: int,
+        num_heads: int,
+        internal_size: int = None,
+        reduction: str = "none",
     ):
         super().__init__()
         if internal_size is None:
@@ -336,6 +348,9 @@ class StructuredSA(torch.nn.Module):
             torch.nn.Tanh(),
             torch.nn.Linear(internal_size, num_heads),
         )
+        self.reduction = reduction
+        if self.reduction == "concat":
+            self.rlinear = torch.nn.Linear(num_heads * input_size, input_size)
 
     __call__: Callable[
         ["StructuredSA", torch.Tensor], Tuple[torch.Tensor, torch.Tensor]
@@ -352,9 +367,13 @@ class StructuredSA(torch.nn.Module):
         scores = self.linear(inputs)
         weights = torch.softmax(scores, dim=-2)
         weightsT = weights.transpose(-1, -2)
-        heads_align = (weightsT @ weights) - weights.new_tensor(
-            torch.eye(self.num_heads)
+        heads_align = (weightsT @ weights) - torch.eye(
+            self.num_heads, device=weights.device, dtype=torch.float
         )
         penalty = torch.norm(heads_align)
         hidden = weightsT @ inputs
+        if self.reduction == "concat":
+            hidden = self.rlinear(hidden.flatten(-2))
+        elif self.reduction == "mean":
+            hidden = torch.mean(hidden, dim=1)
         return hidden, penalty

@@ -2,14 +2,14 @@ data:
   data_folder: "./datasets/ICEWS18"
   hist_len: 6 
   bidirectional: true
-  different_unknowns: true
-  complement_val_and_test: true
-  shuffle: true
+  prepend_val_and_test: true
+  shuffle_seed: false
 
 model:
-  _class: tkgl.models.hiertkgr.HierTKGR
+  _class: tkgl.models.hiertkgr.HierTkgr
   hidden_size: 200
-  num_layers: 2
+  rgcn_num_layers: 2
+  rgcn_self_loop: true
   dropout: 0.2
 
 training:
@@ -22,8 +22,8 @@ training:
   patient: 5
   grad_clip_norm: 1.0
 
-hpspace:
-  data.hist_len: [2, 4, 6, 8, 10]
-  model.num_layers: [1, 2, 3]
-  model.dropout: [0.1, 0.2, 0.3]
-  training.lr: [1.0e-3, 5.0e-4]
+# hpspace:
+#   data.hist_len: [2, 4, 6, 8, 10]
+#   model.num_layers: [1, 2, 3]
+#   model.dropout: [0.1, 0.2, 0.3]
+#   training.lr: [1.0e-3, 5.0e-4]

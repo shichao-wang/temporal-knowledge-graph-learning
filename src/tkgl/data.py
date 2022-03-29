@@ -11,9 +11,8 @@ class Quadruple(TypedDict):
     mmt: Hashable
 
 
-class TkgRExample(TypedDict):
+class TkgrFeature(TypedDict):
     hist_graphs: List[dgl.DGLGraph]
     subj: torch.Tensor
     rel: torch.Tensor
     obj: torch.Tensor
-    quadruples: List[Quadruple]

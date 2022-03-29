@@ -7,7 +7,7 @@ from molurus import hierdict
 from tallow import evaluators
 
 from tkgl.datasets import load_tkg_dataset
-from tkgl.metrics import JointMetric
+from tkgl.metrics import EntMetric, JointMetric
 
 
 def main():
@@ -21,10 +21,11 @@ def main():
     cfg = hierdict.load(open(config_path))
     datasets, vocabs = load_tkg_dataset(**cfg["data"])
 
-    model = molurus.smart_instaniate(
+    model = molurus.smart_instantiate(
         cfg["model"], num_ents=len(vocabs["ent"]), num_rels=len(vocabs["rel"])
     )
-    evaluator = evaluators.Evaluator(datasets, JointMetric())
+    datasets.pop("train")
+    evaluator = evaluators.Evaluator(datasets, EntMetric())
     results = evaluator.execute(model, torch.load(ckpt_path)["model"])
     print(results * 100)
 

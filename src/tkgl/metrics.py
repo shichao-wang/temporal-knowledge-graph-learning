@@ -53,6 +53,23 @@ class EntMRR(MRR):
         return {"e_mrr": super().compute()}
 
 
+class EntMetric(torchmetrics.Metric):
+    def __init__(self) -> None:
+        super().__init__()
+        self.add_state("ent_ranks", torch.tensor([]))
+
+    def update(self, obj_logit: torch.Tensor, obj: torch.Tensor):
+        ent_ranks = logit_ranks(obj_logit, obj)
+        self.ent_ranks = torch.cat([self.ent_ranks, ent_ranks], dim=-1)
+
+    def compute(self):
+        values = {}
+        values["e_mrr"] = mrr_value(self.ent_ranks)
+        for k in (1, 3, 10):
+            values[f"e_hit@{k}"] = hit_value(self.ent_ranks, k)
+        return values
+
+
 class JointMetric(torchmetrics.Metric):
     ent_ranks: torch.Tensor
     rel_ranks: torch.Tensor

@@ -1,14 +1,13 @@
-from turtle import forward
 from typing import List, Tuple
 
 import dgl
 import torch
 from dgl.udf import EdgeBatch
 from torch import nn
-from torch.nn import functional as tnf
+from torch.nn import functional as f
 
+from tkgl.convtranse import ConvTransE
 from tkgl.models.tkgr_model import TkgrModel
-from tkgl.scores import ConvTransENS, ConvTransERS
 
 
 class OmegaRelGraphConv(nn.Module):
@@ -17,14 +16,15 @@ class OmegaRelGraphConv(nn.Module):
         input_size: int,
         hidden_size: int,
         num_layers: int,
+        self_loop: bool,
         dropout: float,
     ):
         super().__init__()
         layer = OmegaGraphConvLayer
 
-        _layers = [layer(input_size, hidden_size, dropout)]
+        _layers = [layer(input_size, hidden_size, dropout, self_loop)]
         for _ in range(1, num_layers):
-            _layers.append(layer(hidden_size, hidden_size, dropout))
+            _layers.append(layer(hidden_size, hidden_size, dropout, self_loop))
         self._layers = torch.nn.ModuleList(_layers)
 
     def forward(
@@ -45,20 +45,18 @@ class OmegaRelGraphConv(nn.Module):
 
 
 class OmegaGraphConvLayer(nn.Module):
-    """
-    Notice:
-    This implementation of RGCN Layer is not equivalent to the one decribed in the paper.
-    In the paper, there is another self-evolve weight matrix(nn.Linear) for those entities do not exist in current graph.
-    We migrate it with `self._loop_linear` here for simplicity.
-    """
-
-    def __init__(self, input_size: int, hidden_size: int, dropout: float):
+    def __init__(
+        self, input_size: int, hidden_size: int, dropout: float, self_loop: bool
+    ):
         super().__init__()
-        self._linear1 = nn.Linear(input_size, hidden_size, bias=False)
-        self._linear2 = nn.Linear(input_size, hidden_size, bias=False)
-        self._linear3 = nn.Linear(input_size, hidden_size, bias=False)
+        self.neigh_linear = nn.Linear(input_size, hidden_size, bias=False)
         self._dropout = torch.nn.Dropout(dropout)
         self._activation = torch.nn.RReLU()
+        self._self_loop = self_loop
+
+        if self._self_loop:
+            self.sl_linear = nn.Linear(input_size, hidden_size, bias=False)
+            self.is_linear = nn.Linear(input_size, hidden_size, bias=False)
 
     def forward(
         self,
@@ -75,25 +73,25 @@ class OmegaGraphConvLayer(nn.Module):
         """
 
         def message_fn(edges: EdgeBatch):
-            msg = self._linear1(edges.src["h"] + edges.data["h"])
+            msg = self.neigh_linear(edges.src["h"] + edges.data["h"])
             return {"msg": msg}
 
-        node_feats = self._dropout(node_feats)
-        edge_feats = self._dropout(edge_feats)
         with graph.local_scope():
             graph.ndata["h"], graph.edata["h"] = node_feats, edge_feats
             graph.update_all(message_fn, dgl.function.mean("msg", "msg"))
             neigh_msg = graph.ndata["msg"]
 
-        self_msg = self._linear2(node_feats)
-        isolate_nids = torch.masked_select(
-            torch.arange(0, graph.number_of_nodes()),
-            (graph.in_degrees() == 0),
-        )
-        iso_msg = self._linear3(node_feats)
-        self_msg[isolate_nids] = iso_msg[isolate_nids]
+        x = neigh_msg
+        if self._self_loop:
+            self_msg = self.sl_linear(node_feats)
+            iso_msg = self.is_linear(node_feats)
+            isolate_nids = graph.in_degrees() == 0
+            self_msg[isolate_nids] = iso_msg[isolate_nids]
+            x = x + self_msg
 
-        return self._activation(neigh_msg + self_msg)
+        x = self._activation(x)
+        x = self._dropout(x)
+        return x
 
 
 class REGCN(TkgrModel):
@@ -102,73 +100,63 @@ class REGCN(TkgrModel):
         num_ents: int,
         num_rels: int,
         hidden_size: int,
-        num_layers: int,
-        kernel_size: int,
-        channels: int,
         dropout: float,
         norm_embeds: bool,
+        rgcn_num_layers: int,
+        rgcn_self_loop: bool,
+        convtranse_kernel_size: int,
+        convtranse_channels: int,
     ):
-        super().__init__()
-        self.num_ents = num_ents
-        self.num_rels = num_rels
-        self.hidden_size = hidden_size
-
+        super().__init__(num_ents, num_rels, hidden_size)
+        self.rgcn = OmegaRelGraphConv(
+            hidden_size, hidden_size, rgcn_num_layers, rgcn_self_loop, dropout
+        )
+        self.glinear = nn.Linear(hidden_size, hidden_size)
+        self.rel_rnn = nn.GRUCell(2 * hidden_size, hidden_size)
+        self.rel_convtranse = ConvTransE(
+            hidden_size,
+            2,
+            convtranse_channels,
+            convtranse_kernel_size,
+            dropout,
+        )
+        self.obj_convtranse = ConvTransE(
+            hidden_size,
+            2,
+            convtranse_channels,
+            convtranse_kernel_size,
+            dropout,
+        )
         self._norm_embeds = norm_embeds
-        self.ent_embeds = nn.Parameter(torch.zeros(num_ents, hidden_size))
-        self.rel_embeds = nn.Parameter(torch.zeros(num_rels, hidden_size))
-        nn.init.normal_(self.ent_embeds)
-        nn.init.xavier_uniform_(self.rel_embeds)
-
-        self._rgcn = OmegaRelGraphConv(
-            hidden_size, hidden_size, num_layers, dropout
-        )
-        self._linear = nn.Linear(hidden_size, hidden_size)
-        self._gru = nn.GRUCell(2 * hidden_size, hidden_size)
-
-        self.rel_score = ConvTransERS(
-            hidden_size=hidden_size,
-            num_channels=channels,
-            kernel_size=kernel_size,
-            dropout=dropout,
-        )
-        self.obj_score = ConvTransENS(
-            hidden_size=hidden_size,
-            num_channels=channels,
-            kernel_size=kernel_size,
-            dropout=dropout,
-        )
-
-    def evolve_step(
-        self, graph: dgl.DGLGraph, ent_emb: torch.Tensor, rel_emb: torch.Tensor
-    ):
-
-        # rel evolution
-        rel_ent_embeds = self._agg_rel_nodes(graph, ent_emb)
-        gru_input = torch.cat([rel_ent_embeds, self.rel_embeds], dim=-1)
-        n_rel_embeds = self._gru(gru_input, rel_emb)
-        n_rel_embeds = self._origin_or_norm(n_rel_embeds)
-        # entity evolution
-        edge_feats = n_rel_embeds[graph.edata["rid"]]
-        node_feats = self._rgcn(graph, ent_emb, edge_feats)
-        node_feats = self._origin_or_norm(node_feats)
-        u = torch.sigmoid(self._linear(ent_emb))
-        n_ent_embeds = ent_emb + u * (node_feats - ent_emb)
-
-        return n_ent_embeds, n_rel_embeds
 
     def evolve(
         self, hist_graphs: List[dgl.DGLGraph]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        ent_embeds = self._origin_or_norm(self.ent_embeds)
-        rel_embeds = self._origin_or_norm(self.rel_embeds)
-        for graph in hist_graphs:
-            # rel evolution
-            # rel_ent_embeds = self.rel_embeds
-            ent_embeds, rel_embeds = self.evolve_step(
-                graph, ent_embeds, rel_embeds
-            )
+        ent_emb = self._origin_or_norm(self.ent_emb)
+        rel_emb = self.rel_emb
 
-        return ent_embeds, rel_embeds
+        hist_ent_emb = []
+        hist_rel_emb = []
+        for graph in hist_graphs:
+            node_feats = ent_emb[graph.ndata["eid"]]
+            # relation evolution
+            rel_ent_emb = self._agg_rel_nodes(graph, node_feats)
+            gru_input = torch.cat([self.rel_emb, rel_ent_emb], dim=-1)
+            rel_emb = self.rel_rnn(gru_input, rel_emb)
+            rel_emb = self._origin_or_norm(rel_emb)
+            # entity evolution
+            edge_feats = rel_emb[graph.edata["rid"]]
+            neigh_feats = self.rgcn(graph, node_feats, edge_feats)
+            neigh_feats = self._origin_or_norm(neigh_feats)
+            cur_ent_emb = neigh_feats[torch.argsort(graph.ndata["eid"])]
+            u = torch.sigmoid(self.glinear(cur_ent_emb))
+            ent_emb = u * cur_ent_emb + (1 - u) * ent_emb
+            ent_emb = self._origin_or_norm(ent_emb)
+
+            hist_ent_emb.append(ent_emb)
+            hist_rel_emb.append(rel_emb)
+
+        return torch.stack(hist_ent_emb), torch.stack(hist_rel_emb)
 
     def forward(
         self,
@@ -186,22 +174,20 @@ class REGCN(TkgrModel):
         Returns:
             logits: (num_triplets, num_entities)
         """
-        ent_embeds, rel_embeds = self.evolve(hist_graphs)
+        hist_ent_emb, hist_rel_emb = self.evolve(hist_graphs)
+        ent_emb = hist_ent_emb[-1]
+        rel_emb = hist_rel_emb[-1]
 
-        subj_embeds = ent_embeds[subj]
-        obj_logit = self.obj_score(subj_embeds, rel_embeds[rel], ent_embeds)
-        rel_logit = self.rel_score(subj_embeds, ent_embeds[obj], rel_embeds)
-
-        return {
-            "obj_logit": obj_logit,
-            "rel_logit": rel_logit,
-            "ent_emb": ent_embeds,
-            "rel_emb": rel_embeds,
-        }
+        subj_emb = ent_emb[subj]
+        obj_inp = torch.stack([subj_emb, rel_emb[rel]], dim=1)
+        obj_logit = self.obj_convtranse(obj_inp) @ ent_emb.t()
+        rel_inp = torch.stack([subj_emb, ent_emb[obj]], dim=1)
+        rel_logit = self.obj_convtranse(rel_inp) @ ent_emb.t()
+        return {"obj_logit": obj_logit, "rel_logit": rel_logit}
 
     def _origin_or_norm(self, tensor: torch.Tensor):
         if self._norm_embeds:
-            return tnf.normalize(tensor)
+            return f.normalize(tensor)
         return tensor
 
     def _agg_rel_nodes(self, graph: dgl.DGLGraph, node_feats: torch.Tensor):
@@ -213,7 +199,7 @@ class REGCN(TkgrModel):
         """
         # (num_rels, num_nodes)
         rel_node_mask = node_feats.new_zeros(
-            self.rel_embeds.size(0), node_feats.size(0), dtype=torch.bool
+            self.rel_emb.size(0), node_feats.size(0), dtype=torch.bool
         )
         src, dst, eids = graph.edges("all")
         rel_ids = graph.edata["rid"][eids]

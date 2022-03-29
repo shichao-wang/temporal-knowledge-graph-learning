@@ -25,7 +25,7 @@ class ConvTransE(torch.nn.Module):
         self._bn3 = torch.nn.BatchNorm1d(hidden_size)
         self._dp3 = torch.nn.Dropout(dropout)
 
-    def forward(self, tuples: torch.Tensor, emb: torch.Tensor):
+    def forward(self, tuples: torch.Tensor):
         """
         Arguments:
             inputs: (num_triplets, in_channels, hidden_size)
@@ -41,4 +41,4 @@ class ConvTransE(torch.nn.Module):
         hidden = self._linear(_.view(num_inputs, -1))
         # (num_triplets, embed_size)
         score = self._bn3(self._dp3(hidden)).relu()
-        return score @ emb.t()
+        return score

@@ -10,7 +10,7 @@ from tallow.metrics import TorchMetric
 from tallow.trainers import Trainer
 
 from tkgl.datasets import load_tkg_dataset
-from tkgl.metrics import EntMRR, JointMetric
+from tkgl.metrics import EntMetric
 from tkgl.models.tkgr_model import TkgrModel
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ def train(save_folder_path: str, cfg: hierdict.HierDict) -> float:
     model = molurus.smart_instantiate(
         cfg["model"], num_ents=len(vocabs["ent"]), num_rels=len(vocabs["rel"])
     )
-    metric = EntMRR()
+    metric = EntMetric()
     best_state_dict = train_model(
         save_folder_path,
         model,

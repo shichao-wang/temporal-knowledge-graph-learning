@@ -3,6 +3,7 @@ import itertools
 import logging
 import os
 import re
+from collections import defaultdict
 from typing import Counter, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import dgl
@@ -12,10 +13,32 @@ import torch
 from tallow.data import datasets, vocabs
 from tallow.data.datasets import Dataset
 from tallow.data.vocabs import Vocab
+from torch.nn import functional as f
 
 from tkgl.data import Quadruple, TkgrFeature
 
 logger = logging.getLogger(__name__)
+
+
+def _sr_so_dict(quads: numpy.ndarray):
+    subj = quads[:, 0]
+    rel = quads[:, 1]
+    obj = quads[:, 2]
+    sr_dict = defaultdict(lambda: defaultdict(list))
+    so_dict = defaultdict(lambda: defaultdict(list))
+    for s, r, o in zip(subj, rel, obj):
+        sr_dict[s][r].append(o)
+        so_dict[s][o].append(r)
+    return sr_dict, so_dict
+
+
+def build_sr_so_dict_list(temporal_quads: List[numpy.ndarray]):
+    sr_list, so_list = [], []
+    for quads in temporal_quads:
+        sr_dict, so_dict = _sr_so_dict(quads)
+        sr_list.append(sr_dict)
+        so_list.append(so_dict)
+    return sr_list, so_list
 
 
 class TkgrDataset(Dataset[TkgrFeature]):
@@ -34,17 +57,25 @@ class TkgrDataset(Dataset[TkgrFeature]):
             build_knowledge_graph(quads, len(self._vocabs["ent"]))
             for quads in self._temporal_quads
         ]
+        self._sr_dict_list, self._so_dict_list = build_sr_so_dict_list(
+            self._temporal_quads
+        )
 
     def __iter__(self) -> Iterator[TkgrFeature]:
         for pid in range(1, len(self._temporal_graphs)):
             xlice = slice(max(pid - self._hist_len, 0), pid)
             hist_graphs = self._temporal_graphs[xlice]
             quads = self._temporal_quads[pid]
+            subj = torch.from_numpy(quads[:, 0])
+            rel = torch.from_numpy(quads[:, 1])
+            obj = torch.from_numpy(quads[:, 2])
             yield TkgrFeature(
                 hist_graphs=hist_graphs,
-                subj=torch.from_numpy(quads[:, 0]),
-                rel=torch.from_numpy(quads[:, 1]),
-                obj=torch.from_numpy(quads[:, 2]),
+                subj=subj,
+                rel=rel,
+                obj=obj,
+                sr_dict=self._sr_dict_list[pid],
+                so_dict=self._so_dict_list[pid],
             )
 
     def __len__(self) -> int:
@@ -65,20 +96,30 @@ class TkgrEvalDataset(Dataset[TkgrFeature]):
         self._hist_len = hist_len
         self._hist_quads = hist_quads
 
+        self._sr_dict_list, self._so_dict_list = build_sr_so_dict_list(
+            self._temporal_quads
+        )
+
     def __iter__(self) -> Iterator[TkgrFeature]:
-        num_nodes = len(self._vocabs["ent"])
+        num_ents = len(self._vocabs["ent"])
         init_quads = self._hist_quads[-self._hist_len :]
         hist_graphs = [
-            build_knowledge_graph(quad, num_nodes) for quad in init_quads
+            build_knowledge_graph(quad, num_ents) for quad in init_quads
         ]
-        for quads in self._temporal_quads:
+        for i, quads in enumerate(self._temporal_quads):
+            subj = torch.from_numpy(quads[:, 0])
+            rel = torch.from_numpy(quads[:, 1])
+            obj = torch.from_numpy(quads[:, 2])
+
             yield TkgrFeature(
                 hist_graphs=hist_graphs,
-                subj=torch.from_numpy(quads[:, 0]),
-                rel=torch.from_numpy(quads[:, 1]),
-                obj=torch.from_numpy(quads[:, 2]),
+                subj=subj,
+                rel=rel,
+                obj=obj,
+                sr_dict=self._sr_dict_list[i],
+                so_dict=self._so_dict_list[i],
             )
-            g = build_knowledge_graph(quads, num_nodes)
+            g = build_knowledge_graph(quads, num_ents)
             hist_graphs.pop(0)
             hist_graphs.append(g)
 

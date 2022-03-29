@@ -38,6 +38,10 @@ def group_reduce_nodes(
 def graph_to_triplets(
     graph: dgl.DGLGraph, ent_embeds: torch.Tensor, rel_embeds: torch.Tensor
 ) -> torch.Tensor:
+    """
+    Returns:
+        (T, 3, H)
+    """
 
     src, dst, eid = graph.edges("all")
     subj = graph.ndata["eid"][src]
@@ -239,25 +243,56 @@ class HierTkgr(TkgrModel):
     ) -> None:
         super().__init__(num_ents, num_rels, hidden_size)
 
-        self._rnn1 = torch.nn.GRUCell(2 * hidden_size, hidden_size)
-        self._mrgcn = OmegaRelGraphConv(
+        self.rgcn = OmegaRelGraphConv(
+            hidden_size, hidden_size, rgcn_num_layers, rgcn_self_loop, dropout
+        )
+        self.glinear = torch.nn.Linear(hidden_size, hidden_size)
+        self.rel_rnn = torch.nn.GRUCell(2 * hidden_size, hidden_size)
+        self.qlinear = torch.nn.Linear(2 * hidden_size, hidden_size)
+        self.trip_linear = torch.nn.Linear(3 * hidden_size, hidden_size)
+        self.trip_rnn = torch.nn.GRU(
+            hidden_size, hidden_size, batch_first=False
+        )
+        convtranse_channels = 50
+        convtranse_kernel_size = 3
+        self.convtranse = ConvTransE(
             hidden_size,
-            hidden_size,
-            num_layers=rgcn_num_layers,
-            self_loop=rgcn_self_loop,
-            dropout=dropout,
+            3,
+            convtranse_channels,
+            convtranse_kernel_size,
+            dropout,
         )
 
-        self._linear1 = torch.nn.Linear(hidden_size, hidden_size)
-        self._linear2 = torch.nn.Linear(3 * hidden_size, hidden_size)
-        self._linear3 = torch.nn.Linear(2 * hidden_size, hidden_size)
-        self._linear4 = torch.nn.Linear(2 * hidden_size, hidden_size)
-        self._linear5 = torch.nn.Linear(hidden_size, hidden_size)
-        self._linear6 = torch.nn.Linear(hidden_size, hidden_size)
-        self._rnn2 = torch.nn.GRU(hidden_size, hidden_size)
-        self._rnn3 = torch.nn.GRU(hidden_size, hidden_size)
+    def evolve(self, hist_graphs: List[dgl.DGLGraph]):
+        ent_emb = f.normalize(self.ent_emb)
+        rel_emb = self.rel_emb
 
-        self.convtranse = ConvTransE(hidden_size, 2, 50, 3, dropout)
+        ent_emb_list = []
+        rel_emb_list = []
+        for graph in hist_graphs:
+            node_feats = ent_emb[graph.ndata["eid"]]
+            # relation evolution
+            rel_ent_emb = group_reduce_nodes(
+                graph, ent_emb, graph.edata["rid"], self.num_ents, self.num_rels
+            )
+            gru_input = torch.cat([self.rel_emb, rel_ent_emb], dim=-1)
+            rel_emb = self.rel_rnn(gru_input, rel_emb)
+            rel_emb = f.normalize(rel_emb)
+            # entity evolution
+            edge_feats = rel_emb[graph.edata["rid"]]
+            neigh_feats = self.rgcn(graph, node_feats, edge_feats)
+            neigh_feats = f.normalize(neigh_feats)
+            cur_ent_emb = neigh_feats[torch.argsort(graph.ndata["eid"])]
+            u = torch.sigmoid(self.glinear(cur_ent_emb))
+            ent_emb = u * cur_ent_emb + (1 - u) * ent_emb
+            ent_emb = f.normalize(ent_emb)
+
+            ent_emb_list.append(ent_emb)
+            rel_emb_list.append(rel_emb)
+
+        hist_ent_emb = torch.stack(ent_emb_list)
+        hist_rel_emb = torch.stack(rel_emb_list)
+        return hist_ent_emb, hist_rel_emb
 
     def forward(
         self,
@@ -266,69 +301,41 @@ class HierTkgr(TkgrModel):
         rel: torch.Tensor,
         # obj: torch.Tensor,
     ):
-        ent_emb = f.normalize(self.ent_emb)
-        rel_emb = f.normalize(self.rel_emb)
-        hist_trip_list = []
-        hist_global_list = []
-        for graph in hist_graphs:
-            node_rel_emb = group_reduce_nodes(
-                graph, ent_emb, graph.edata["rid"], self.num_ents, self.num_rels
+        hist_ent_emb, hist_rel_emb = self.evolve(hist_graphs)
+        ent_emb = hist_ent_emb[-1]
+        rel_emb = hist_rel_emb[-1]
+        queries = self.qlinear(torch.cat([ent_emb[subj], rel_emb[rel]], dim=1))
+        triplets_list = [
+            graph_to_triplets(hist_graphs[i], hist_ent_emb[i], hist_rel_emb[i])
+            for i in range(len(hist_graphs))
+        ]
+        hist_triplets = torch.cat(triplets_list, dim=0)
+        num_triplets = hist_triplets.new_tensor(
+            [trip.size(0) for trip in triplets_list], dtype=torch.long
+        )
+        trip_repr = self.trip_linear(
+            hist_triplets.view(hist_triplets.size(0), -1)
+        )
+        trip_scores = trip_repr @ queries.t()
+        # (T, Q)
+        trip_weights = dgl.ops.segment_softmax(num_triplets, trip_scores)
+
+        trip_emb_list = []
+        i = 0
+        for length in num_triplets:
+            trip_emb = (
+                trip_weights[i : i + length].t() @ trip_repr[i : i + length]
             )
-            gru_inputs = torch.cat([node_rel_emb, self.rel_emb], dim=-1)
-            rel_emb = self._rnn1(gru_inputs, rel_emb)
-            rel_emb = f.normalize(rel_emb)
+            trip_emb_list.append(trip_emb)
+            i = i + length
+        hist_trip_emb = torch.stack(trip_emb_list)
+        hist_trip_hid, _ = self.trip_rnn(hist_trip_emb)
 
-            edge_feats = rel_emb[graph.edata["rid"]]
-            node_feats = self._mrgcn(graph, ent_emb, edge_feats)
-            node_feats = f.normalize(node_feats)
-            u = torch.sigmoid(self._linear1(node_feats))
-            ent_emb = f.normalize(ent_emb + u * (node_feats - ent_emb))
-
-            queries = torch.cat([ent_emb[subj], rel_emb[rel]], dim=-1)
-            # semantic
-            triples = graph_to_triplets(graph, ent_emb, rel_emb)
-            triples = self._linear2(triples.view(triples.size(0), -1))
-            # trip_v = triples[:, 2]
-            weights = torch.softmax(
-                self._linear3(queries) @ triples.t(), dim=-1
-            )
-            trip_hidden = weights @ triples
-
-            glob_weights = torch.softmax(
-                self._linear4(queries) @ ent_emb.t(), dim=-1
-            )
-            glob_hidden = glob_weights @ ent_emb
-
-            hist_trip_list.append(trip_hidden)
-            hist_global_list.append(glob_hidden)
-
-        hist_trip = torch.stack(hist_trip_list, dim=0)
-        hist_trip_hidden, _ = self._rnn2(hist_trip)
-
-        hist_global = torch.stack(hist_global_list, dim=0)
-        hist_global_hidden, _ = self._rnn3(hist_global)
-
-        pred_inp = torch.stack([ent_emb[subj], rel_emb[rel]], dim=1)
-        # obj_logit = self.convtranse(pred_inp) @ ent_emb.t()
-        trip_logit = self._linear5(hist_trip_hidden[-1]).relu() @ ent_emb.t()
-        glob_logit = self._linear6(hist_global_hidden[-1]).relu() @ ent_emb.t()
-
-        # bg = dgl.batch(hist_graphs)
-        # src, dst, eid = bg.edges("all")
-        # # (Q, E)
-        # subj_mask = subj.unsqueeze(dim=-1) == bg.ndata["eid"][src]
-        # rel_mask = rel.unsqueeze(dim=-1) == bg.edata["rid"][eid]
-        # mask = torch.bitwise_and(subj_mask, rel_mask)
-
-        # hist_obj = ent_emb[bg.ndata["eid"][dst]]
-        # hist_obj = ent_emb
-        # q = self._linear4(torch.cat([ent_emb[subj], rel_emb[rel]], dim=-1))
-        # scores = q @ hist_obj.t()
-        # # scores = torch.masked_fill(scores, ~mask, -999999)
-        # weights = torch.softmax(scores, dim=-1)
-        # hist_obj_agg = weights @ hist_obj
-        # hist_obj_logit = self._linear5(hist_obj_agg).relu() @ ent_emb.t()
-        return {"obj_logit": trip_logit + glob_logit}
+        pred_inp = torch.stack(
+            [ent_emb[subj], rel_emb[rel], hist_trip_hid[-1]], dim=1
+        )
+        obj_logit = self.convtranse(pred_inp) @ ent_emb.t()
+        return {"obj_logit": obj_logit}
 
 
 class StructuredSA(torch.nn.Module):

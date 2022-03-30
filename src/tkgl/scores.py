@@ -2,7 +2,7 @@ import abc
 
 import torch
 
-from .convtranse import ConvTransE
+from .modules.convtranse import ConvTransE
 
 
 class NodeScoreFunction(torch.nn.Module):

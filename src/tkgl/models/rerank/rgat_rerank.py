@@ -7,7 +7,7 @@ from tkgl.modules.rgat import RelGat
 from tkgl.scores import ConvTransENS
 
 from .rerank import RerankTkgrModel, TkgrModel
-from .rgcn_rerank import _build_obj_pred_graph
+from .rgcn_rerank import build_candidate_subgraph
 
 
 class RelGatRerank(RerankTkgrModel):
@@ -45,7 +45,7 @@ class RelGatRerank(RerankTkgrModel):
             backbone_outputs = self.backbone(hist_graphs, subj, rel, obj)
 
         obj_logit_orig = dict.pop(backbone_outputs, "obj_logit")
-        obj_pred_graph = _build_obj_pred_graph(
+        obj_pred_graph = build_candidate_subgraph(
             self.backbone.num_ents, subj, rel, obj_logit_orig, self.k
         )
         ent_emb = backbone_outputs["ent_emb"]

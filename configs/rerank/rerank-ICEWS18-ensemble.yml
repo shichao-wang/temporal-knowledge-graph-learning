@@ -7,23 +7,14 @@ data:
 
 model:
   _class: tkgl.models.rerank.RelGraphConvRerank
-  backbone: 
-    _class: tkgl.models.regcn.REGCN
-    hidden_size: 200
-    rgcn_num_layers: 2
-    rgcn_self_loop: true
-    convtranse_kernel_size: 3
-    convtranse_channels: 50
-    dropout: 0.2
-    norm_embeds: true
+  pretrained_backbone: null
+  finetune: false
   k: 10
   rgcn_num_layers: 2
   rgcn_self_loop: true
-  kernel_size: 3
-  num_channels: 50
+  convtranse_kernel_size: 3
+  convtranse_num_channels: 50
   dropout: 0.2
-  finetune: false
-  pretrained_backbone: null
 
 
 training:

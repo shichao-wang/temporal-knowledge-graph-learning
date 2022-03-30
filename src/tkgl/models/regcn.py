@@ -6,7 +6,7 @@ from dgl.udf import EdgeBatch
 from torch import nn
 from torch.nn import functional as f
 
-from tkgl.convtranse import ConvTransE
+from tkgl.modules.convtranse import ConvTransE
 from tkgl.models.tkgr_model import TkgrModel
 
 
@@ -149,7 +149,7 @@ class REGCN(TkgrModel):
             neigh_feats = self.rgcn(graph, node_feats, edge_feats)
             neigh_feats = self._origin_or_norm(neigh_feats)
             cur_ent_emb = neigh_feats[torch.argsort(graph.ndata["eid"])]
-            u = torch.sigmoid(self.glinear(cur_ent_emb))
+            u = torch.sigmoid(self.glinear(ent_emb))
             ent_emb = u * cur_ent_emb + (1 - u) * ent_emb
             ent_emb = self._origin_or_norm(ent_emb)
 
@@ -211,8 +211,9 @@ class REGCN(TkgrModel):
         rel_node_mask[rel_ids, src] = True
         rel_node_mask[rel_ids, dst] = True
 
+        rel_num_nodes = rel_node_mask.sum(dim=1, dtype=torch.long)
         node_ids = torch.nonzero(rel_node_mask)[:, 1]
         rel_embeds = dgl.ops.segment_reduce(
-            rel_node_mask.sum(dim=1), node_feats[node_ids], "mean"
+            rel_num_nodes, node_feats[node_ids], "mean"
         )
-        return torch.nan_to_num(rel_embeds, 0)
+        return rel_embeds

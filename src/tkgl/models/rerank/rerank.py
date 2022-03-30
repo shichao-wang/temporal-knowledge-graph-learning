@@ -1,10 +1,13 @@
 import copy
 import logging
+import os
 from typing import List
 
 import dgl
+import molurus
 import torch
-from torch.nn import functional as tfn
+from molurus import hierdict
+from torch.nn import functional as f
 
 from tkgl.models.tkgr_model import TkgrModel
 
@@ -14,12 +17,22 @@ logger = logging.getLogger(__name__)
 class RerankTkgrModel(torch.nn.Module):
     def __init__(
         self,
-        backbone: TkgrModel,
+        num_ents: int,
+        num_rels: int,
+        pretrained_backbone: str,
         finetune: bool,
-        pretrained_backbone: str = None,
+        config_path: str = None,
     ):
         super().__init__()
-        self.backbone = backbone
+        if config_path is None:
+            config_path = os.path.join(
+                os.path.dirname(pretrained_backbone), "config.yml"
+            )
+        bb_cfg = hierdict.load(open(config_path))
+        self.backbone: TkgrModel = molurus.smart_instantiate(
+            bb_cfg["model"], num_ents=num_ents, num_rels=num_rels
+        )
+
         self.finetune = finetune
         if pretrained_backbone:
             logger.info("Load backbone from %s", pretrained_backbone)
@@ -33,21 +46,16 @@ class RerankTkgrModel(torch.nn.Module):
 
 
 class RerankLoss(torch.nn.Module):
-    def __init__(self, alpha: float, beta: float):
+    def __init__(self, alpha: float):
         super().__init__()
         self._alpha = alpha
-        self._beta = beta
 
     def forward(
         self,
         obj_logit: torch.Tensor,
         obj_logit_orig: torch.Tensor,
         obj: torch.Tensor,
-        rel_logit: torch.Tensor,
-        rel: torch.Tensor,
     ):
-        obj_orig_loss = tfn.cross_entropy(obj_logit_orig, obj)
-        rel_loss = tfn.cross_entropy(rel_logit, rel)
-        obj_loss = tfn.cross_entropy(obj_logit, obj)
-        orig_loss = self._alpha * obj_orig_loss + (1 - self._alpha) * rel_loss
-        return self._beta * orig_loss + (1 - self._beta) * obj_loss
+        obj_orig_loss = f.cross_entropy(obj_logit_orig, obj)
+        obj_loss = f.cross_entropy(obj_logit, obj)
+        return self._alpha * obj_orig_loss + (1 - self._alpha) * obj_loss

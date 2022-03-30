@@ -3,7 +3,7 @@ data:
   hist_len: 6 
   bidirectional: true
   prepend_val_and_test: true
-  shuffle_seed: false
+  shuffle_seed: 1234
 
 model:
   _class: tkgl.models.regcn.REGCN
@@ -17,8 +17,8 @@ model:
 
 training:
   criterion:
-    _class: tkgl.models.JointLoss
-    alpha: 0.7
+    _class: tkgl.models.EntLoss
+    # alpha: 0.7
   optim:
     _class: torch.optim.Adam
     lr: 1.0e-3

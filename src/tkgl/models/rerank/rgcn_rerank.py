@@ -3,6 +3,7 @@ from typing import List
 import dgl
 import torch
 
+from tkgl.convtranse import ConvTransE
 from tkgl.models.regcn import OmegaRelGraphConv
 from tkgl.models.tkgr_model import TkgrModel
 from tkgl.scores import ConvTransENS
@@ -15,7 +16,8 @@ class RelGraphConvRerank(RerankTkgrModel):
         self,
         backbone: TkgrModel,
         k: int,
-        num_layers: int,
+        rgcn_num_layers: int,
+        rgcn_self_loop: bool,
         num_channels: int,
         kernel_size: int,
         dropout: float,
@@ -25,10 +27,14 @@ class RelGraphConvRerank(RerankTkgrModel):
         super().__init__(backbone, finetune, pretrained_backbone)
         self._k = k
         self._rgcn = OmegaRelGraphConv(
-            self.hidden_size, self.hidden_size, num_layers, dropout
+            self.hidden_size,
+            self.hidden_size,
+            rgcn_num_layers,
+            rgcn_self_loop,
+            dropout,
         )
-        self.obj_score = ConvTransENS(
-            self.hidden_size, num_channels, kernel_size, dropout
+        self.obj_score = ConvTransE(
+            self.hidden_size, 2, num_channels, kernel_size, dropout
         )
 
     def forward(
@@ -44,14 +50,15 @@ class RelGraphConvRerank(RerankTkgrModel):
         obj_pred_graph = _build_obj_pred_graph(
             self.backbone.num_ents, subj, rel, obj_logit_orig, self._k
         )
-        ent_emb = backbone_outputs["ent_emb"]
-        rel_emb = backbone_outputs["rel_emb"]
+        ent_emb = backbone_outputs["hist_ent_emb"][-1]
+        rel_emb = backbone_outputs["hist_rel_emb"][-1]
         node_feats = self._rgcn(
             obj_pred_graph,
             ent_emb[obj_pred_graph.ndata["eid"]],
             rel_emb[obj_pred_graph.edata["rid"]],
         )
-        obj_logit = self.obj_score(node_feats[subj], rel_emb[rel], ent_emb)
+        pred_inp = torch.stack([node_feats[subj], rel_emb[rel]], dim=1)
+        obj_logit = self.obj_score(pred_inp) @ ent_emb.t()
         return {
             "obj_logit": obj_logit,
             "obj_logit_orig": obj_logit_orig,

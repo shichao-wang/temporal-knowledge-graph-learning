@@ -24,7 +24,6 @@ def train_model(
     metric: TorchMetric,
     tr_cfg: hierdict.HierDict,
 ):
-    print(tr_cfg)
     criterion = molurus.smart_instantiate(tr_cfg["criterion"])
     optimizer = molurus.smart_instantiate(
         tr_cfg["optim"],
@@ -56,6 +55,7 @@ def validate_and_dump_config(
 
 
 def train(save_folder_path: str, cfg: hierdict.HierDict) -> float:
+    logger.info(cfg)
     cfg.setdefault("seed", 1234)
     validate_and_dump_config(save_folder_path, cfg)
     seed_all(cfg["seed"])

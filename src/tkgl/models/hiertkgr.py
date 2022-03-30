@@ -72,44 +72,22 @@ def build_r2n_mask(
     return rn_mask
 
 
-def qkv_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    qk_mask: torch.Tensor = None,
-):
-    """
-    Arguments:
-        q: (Q, H)
-        k: (KV, H)
-        v: (KV, H)
-        qk_mask: (Q, KV)
-    """
-    d = q.size(-1)
-    s = (q @ k.t()) / torch.sqrt(d)  # (Q, KV)
-    if qk_mask is not None:
-        s.masked_fill_(~qk_mask, float("-inf"))
-    a = s.softmax(s, dim=-1)
-    return a @ v, a
-
-
 class MultiRelGraphConv(torch.nn.Module):
     def __init__(
         self,
         input_sizse: int,
         hidden_size: int,
         num_layers: int,
+        self_loop: bool,
         dropout: float,
     ):
         super().__init__()
         layer = MultiRelGraphLayer
-        _layers = [layer(input_sizse, hidden_size, dropout)]
+        _layers = [layer(input_sizse, hidden_size, self_loop, dropout)]
         for _ in range(1, num_layers):
-            _layers.append(layer(hidden_size, hidden_size, dropout))
-        self._layers = torch.nn.ModuleList(_layers)
-        self._linear = torch.nn.Linear(
-            hidden_size * (1 + num_layers), hidden_size
-        )
+            _layers.append(layer(hidden_size, hidden_size, self_loop, dropout))
+        self.layers = torch.nn.ModuleList(_layers)
+        self.olinear = torch.nn.Linear(hidden_size * num_layers, hidden_size)
 
     __call__: Callable[
         [
@@ -128,23 +106,33 @@ class MultiRelGraphConv(torch.nn.Module):
         node_feats: torch.Tensor,
         edge_feats: torch.Tensor,
     ):
-        msg_box = [node_feats]
-        for layer in self._layers:
-            neighbor_msg = layer(graph, msg_box[-1], edge_feats)
-            msg_box.append(neighbor_msg)
+        neigh_msg_list = []
+        neigh_feats = node_feats
+        for layer in self.layers:
+            neigh_feats = layer(graph, neigh_feats, edge_feats)
+            neigh_msg_list.append(neigh_feats)
 
-        multihop_neighbor = torch.cat(msg_box, dim=-1)
-        return self._linear(multihop_neighbor)
+        multihop_neighbor = torch.cat(neigh_msg_list, dim=-1)
+        return self.olinear(multihop_neighbor)
 
 
 class MultiRelGraphLayer(torch.nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        self_loop: bool,
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        self._linear1 = torch.nn.Linear(2 * input_size, hidden_size)
-        self._linear2 = torch.nn.Linear(input_size, hidden_size)
-        self._linear3 = torch.nn.Linear(input_size, hidden_size)
+        self.neigh_linear = torch.nn.Linear(2 * input_size, hidden_size)
+        self._self_loop = self_loop
+
         self._dropout = torch.nn.Dropout(dropout)
         self._activation = torch.nn.RReLU()
+
+        if self._self_loop:
+            self.looplinear = torch.nn.Linear(input_size, hidden_size)
 
     def forward(
         self,
@@ -154,7 +142,7 @@ class MultiRelGraphLayer(torch.nn.Module):
     ):
         def message_fn(edges: EdgeBatch):
             msg_inp = torch.cat([edges.src["h"], edges.data["h"]], dim=-1)
-            msg = self._linear1(msg_inp)
+            msg = self.neigh_linear(msg_inp)
             return {"msg": msg}
 
         node_feats = self._dropout(node_feats)
@@ -165,12 +153,11 @@ class MultiRelGraphLayer(torch.nn.Module):
             # node msg
             graph.update_all(message_fn, dgl.function.mean("msg", "msg"))
 
-            node_msg = graph.ndata["msg"]
-        node_feats = node_msg
+            neigh_msg = graph.ndata["msg"]
 
-        self_msg = self._linear2(node_feats)
-        node_feats = node_feats + self_msg
-
+        if self._self_loop:
+            self_msg = self.looplinear(node_feats)
+            neigh_msg = neigh_msg + self_msg
         return self._activation(node_feats)
 
 
@@ -180,12 +167,15 @@ class HighwayHierTkgr(TkgrModel):
         num_ents: int,
         num_rels: int,
         hidden_size: int,
-        num_layers: int,
+        rgcn_num_layers: int,
+        rgcn_self_loop: bool,
         dropout: float,
     ):
         super().__init__(num_ents, num_rels, hidden_size)
+        torch.nn.init.xavier_uniform_(self.ent_emb)
+        torch.nn.init.xavier_uniform_(self.rel_emb)
         self.mrgcn = MultiRelGraphConv(
-            hidden_size, hidden_size, num_layers, dropout
+            hidden_size, hidden_size, rgcn_num_layers, rgcn_self_loop, dropout
         )
         self.transformer_encoder = torch.nn.TransformerEncoder(
             torch.nn.TransformerEncoderLayer(hidden_size, 4, dropout=dropout),
@@ -208,8 +198,8 @@ class HighwayHierTkgr(TkgrModel):
         total_neighbor_emb = self.mrgcn(
             bg, ent_emb[bg.ndata["eid"]], rel_emb[bg.edata["rid"]]
         )
-        # sf means seqlen first
-        neighbor_emb_lf = torch.stack(
+        # lf means seqlen first
+        hist_ent_neigh_emb_lf = torch.stack(
             torch.split_with_sizes(
                 total_neighbor_emb, bg.batch_num_nodes().tolist()
             ),
@@ -217,17 +207,18 @@ class HighwayHierTkgr(TkgrModel):
         )
         seq_len = len(hist_graphs)
         mask = torch.triu(
-            neighbor_emb_lf.new_ones((seq_len, seq_len), dtype=torch.bool)
+            hist_ent_neigh_emb_lf.new_ones((seq_len, seq_len), dtype=torch.bool)
+        )
+        hist_ent_neigh_emb_lf = f.normalize(
+            hist_ent_neigh_emb_lf + ent_emb.unsqueeze(dim=0)
         )
         hist_ent_emb = self.transformer_encoder(
-            hist_ent_emb + positional_encoding(hist_ent_emb),
+            hist_ent_neigh_emb_lf + positional_encoding(hist_ent_neigh_emb_lf),
             mask=~mask,
         )
-        hist_ent_emb = torch.transpose(hist_ent_emb, 0, 1)
-
-        evolve_ent_emb, _ = self.ssa(hist_ent_emb)
+        evolve_ent_emb = torch.mean(hist_ent_emb, dim=0)
         q = torch.stack([evolve_ent_emb[subj], self.rel_emb[rel]], dim=1)
-        obj_logit = self.convtranse(q) @ evolve_ent_emb.t()
+        obj_logit = self.convtranse(q) @ self.ent_emb.t()
         return {"obj_logit": obj_logit}
 
 
@@ -242,22 +233,27 @@ class HierTkgr(TkgrModel):
         rgcn_self_loop: bool,
     ) -> None:
         super().__init__(num_ents, num_rels, hidden_size)
+        torch.nn.init.xavier_uniform_(self.ent_emb)
+        torch.nn.init.xavier_uniform_(self.rel_emb)
 
-        self.rgcn = OmegaRelGraphConv(
+        self.rgcn = MultiRelGraphConv(
             hidden_size, hidden_size, rgcn_num_layers, rgcn_self_loop, dropout
         )
         self.glinear = torch.nn.Linear(hidden_size, hidden_size)
         self.rel_rnn = torch.nn.GRUCell(2 * hidden_size, hidden_size)
-        self.qlinear = torch.nn.Linear(2 * hidden_size, hidden_size)
+        self.trip_qlinear = torch.nn.Linear(2 * hidden_size, hidden_size)
         self.trip_linear = torch.nn.Linear(3 * hidden_size, hidden_size)
         self.trip_rnn = torch.nn.GRU(
+            hidden_size, hidden_size, batch_first=False
+        )
+        self.glob_rnn = torch.nn.GRU(
             hidden_size, hidden_size, batch_first=False
         )
         convtranse_channels = 50
         convtranse_kernel_size = 3
         self.convtranse = ConvTransE(
             hidden_size,
-            3,
+            2,
             convtranse_channels,
             convtranse_kernel_size,
             dropout,
@@ -302,40 +298,42 @@ class HierTkgr(TkgrModel):
         # obj: torch.Tensor,
     ):
         hist_ent_emb, hist_rel_emb = self.evolve(hist_graphs)
+
+        trip_hid_list = []
+        glob_hid_list = []
+        for i, graph in enumerate(hist_graphs):
+            ent_emb = hist_ent_emb[i]
+            rel_emb = hist_rel_emb[i]
+            queries = torch.cat([ent_emb[subj], rel_emb[rel]], dim=1)
+
+            # trip
+            triplets = graph_to_triplets(graph, ent_emb, rel_emb)
+            trip_emb = self.trip_linear(triplets.view(triplets.size(0), -1))
+            trip_weights = torch.softmax(
+                self.trip_qlinear(queries) @ trip_emb.t(), dim=-1
+            )
+            trip_hid = trip_weights @ trip_emb
+            trip_hid_list.append(trip_hid)
+
+            # global
+            glob_emb = torch.mean(ent_emb, dim=0)
+            glob_hid_list.append(
+                glob_emb.unsqueeze(0).expand(queries.size(0), -1)
+            )
+
+        hist_trip_hid = torch.stack(trip_hid_list)
+        hist_trip_hid, _ = self.trip_rnn(hist_trip_hid)
+
+        hist_glob_hid = torch.stack(glob_hid_list)
+        hist_glob_hid, _ = self.glob_rnn(hist_glob_hid)
+
         ent_emb = hist_ent_emb[-1]
         rel_emb = hist_rel_emb[-1]
-        queries = self.qlinear(torch.cat([ent_emb[subj], rel_emb[rel]], dim=1))
-        triplets_list = [
-            graph_to_triplets(hist_graphs[i], hist_ent_emb[i], hist_rel_emb[i])
-            for i in range(len(hist_graphs))
-        ]
-        hist_triplets = torch.cat(triplets_list, dim=0)
-        num_triplets = hist_triplets.new_tensor(
-            [trip.size(0) for trip in triplets_list], dtype=torch.long
-        )
-        trip_repr = self.trip_linear(
-            hist_triplets.view(hist_triplets.size(0), -1)
-        )
-        trip_scores = trip_repr @ queries.t()
-        # (T, Q)
-        trip_weights = dgl.ops.segment_softmax(num_triplets, trip_scores)
-
-        trip_emb_list = []
-        i = 0
-        for length in num_triplets:
-            trip_emb = (
-                trip_weights[i : i + length].t() @ trip_repr[i : i + length]
-            )
-            trip_emb_list.append(trip_emb)
-            i = i + length
-        hist_trip_emb = torch.stack(trip_emb_list)
-        hist_trip_hid, _ = self.trip_rnn(hist_trip_emb)
-
-        pred_inp = torch.stack(
-            [ent_emb[subj], rel_emb[rel], hist_trip_hid[-1]], dim=1
-        )
-        obj_logit = self.convtranse(pred_inp) @ ent_emb.t()
-        return {"obj_logit": obj_logit}
+        pred_inp = torch.stack([ent_emb[subj], rel_emb[rel]], dim=1)
+        kg_logit = self.convtranse(pred_inp) @ ent_emb.t()
+        # trip_logit = hist_trip_hid[-1].relu() @ ent_emb.t()
+        # glob_logit = hist_glob_hid[-1].relu() @ ent_emb.t()
+        return {"obj_logit": kg_logit}  # + glob_logit}
 
 
 class StructuredSA(torch.nn.Module):

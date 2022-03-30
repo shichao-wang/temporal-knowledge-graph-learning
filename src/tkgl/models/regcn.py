@@ -183,7 +183,12 @@ class REGCN(TkgrModel):
         obj_logit = self.obj_convtranse(obj_inp) @ ent_emb.t()
         rel_inp = torch.stack([subj_emb, ent_emb[obj]], dim=1)
         rel_logit = self.obj_convtranse(rel_inp) @ rel_emb.t()
-        return {"obj_logit": obj_logit, "rel_logit": rel_logit}
+        return {
+            "obj_logit": obj_logit,
+            "rel_logit": rel_logit,
+            "hist_ent_emb": hist_ent_emb,
+            "hist_rel_emb": hist_rel_emb,
+        }
 
     def _origin_or_norm(self, tensor: torch.Tensor):
         if self._norm_embeds:

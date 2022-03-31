@@ -2,12 +2,12 @@ from typing import List, Tuple
 
 import dgl
 import torch
-from dgl.udf import EdgeBatch
+from dgl.udf import EdgeBatch, NodeBatch
 from torch import nn
 from torch.nn import functional as f
 
-from tkgl.modules.convtranse import ConvTransE
 from tkgl.models.tkgr_model import TkgrModel
+from tkgl.modules.convtranse import ConvTransE
 
 
 class OmegaRelGraphConv(nn.Module):
@@ -50,8 +50,8 @@ class OmegaGraphConvLayer(nn.Module):
     ):
         super().__init__()
         self.neigh_linear = nn.Linear(input_size, hidden_size, bias=False)
-        self._dropout = torch.nn.Dropout(dropout)
         self._activation = torch.nn.RReLU()
+        self._dropout = torch.nn.Dropout(dropout)
         self._self_loop = self_loop
 
         if self._self_loop:
@@ -76,22 +76,29 @@ class OmegaGraphConvLayer(nn.Module):
             msg = self.neigh_linear(edges.src["h"] + edges.data["h"])
             return {"msg": msg}
 
+        def apply_fn(nodes: NodeBatch):
+            return {"msg": nodes.data["msg"] * nodes.data["norm"]}
+
+        in_deg = torch.Tensor.float(graph.in_degrees())
+        in_deg[torch.nonzero(in_deg == 0)] = 1.0
+
         with graph.local_scope():
             graph.ndata["h"], graph.edata["h"] = node_feats, edge_feats
-            graph.update_all(message_fn, dgl.function.mean("msg", "msg"))
+            graph.ndata["norm"] = (1.0 / in_deg).unsqueeze(dim=-1)
+            graph.update_all(
+                message_fn, dgl.function.sum("msg", "msg"), apply_fn
+            )
             neigh_msg = graph.ndata["msg"]
 
-        x = neigh_msg
         if self._self_loop:
             self_msg = self.sl_linear(node_feats)
             iso_msg = self.is_linear(node_feats)
             isolate_nids = graph.in_degrees() == 0
             self_msg[isolate_nids] = iso_msg[isolate_nids]
-            x = x + self_msg
+            neigh_msg = neigh_msg + self_msg
 
-        x = self._activation(x)
-        x = self._dropout(x)
-        return x
+        neigh_msg = self._activation(neigh_msg)
+        return self._dropout(neigh_msg)
 
 
 class REGCN(TkgrModel):

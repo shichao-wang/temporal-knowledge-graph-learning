@@ -3,10 +3,11 @@ from typing import List
 import dgl
 import torch
 
+from tkgl.models.tkgr_model import TkgrModel
 from tkgl.modules.rgcn import RGCN
 
 
-class EvoKg(torch.nn.Module):
+class EvoKg(TkgrModel):
     def __init__(
         self,
         num_ents: int,
@@ -15,7 +16,7 @@ class EvoKg(torch.nn.Module):
         num_layers: int,
         dropout: float,
     ):
-        super().__init__()
+        super().__init__(num_ents, num_rels, hidden_size)
         self._rgcn = RGCN(
             hidden_size, hidden_size, num_rels, num_layers, dropout
         )
@@ -23,11 +24,6 @@ class EvoKg(torch.nn.Module):
         self._rnn2 = torch.nn.GRU(hidden_size, hidden_size, batch_first=True)
         self._linear1 = torch.nn.Linear(3 * hidden_size, num_rels)
         self._linear2 = torch.nn.Linear(5 * hidden_size, num_ents)
-
-        self.ent_embeds = torch.nn.Parameter(torch.zeros(num_ents, hidden_size))
-        self.rel_embeds = torch.nn.Parameter(torch.zeros(num_rels, hidden_size))
-        torch.nn.init.xavier_normal_(self.ent_embeds)
-        torch.nn.init.xavier_uniform_(self.rel_embeds)
 
     def forward(
         self,
@@ -37,31 +33,31 @@ class EvoKg(torch.nn.Module):
         obj: torch.Tensor,
     ):
         bg = dgl.batch(hist_graphs)
-        total_nfeats = self._rgcn(bg, self.ent_embeds[bg.ndata["eid"]])
+        total_nfeats = self._rgcn(bg, self.ent_emb[bg.ndata["eid"]])
         hist_nfeat_list = torch.split_with_sizes(
             total_nfeats, bg.batch_num_nodes().tolist()
         )
         hist_nfeats = torch.stack(hist_nfeat_list, dim=1)
-        _, ent_dembeds = self._rnn1(hist_nfeats)
-        ent_dembeds = torch.squeeze(ent_dembeds, dim=0)
+        _, ent_hid = self._rnn1(hist_nfeats)
+        ent_hid = torch.squeeze(ent_hid, dim=0)
 
         hist_rfeat_list = []
         for nfeats, graph in zip(hist_nfeat_list, hist_graphs):
             hist_rfeat_list.append(self._agg_rel_nodes(graph, nfeats))
         hist_rfeats = torch.stack(hist_rfeat_list, dim=1)
-        _, rel_dembeds = self._rnn2(hist_rfeats)
-        rel_dembeds = torch.squeeze(rel_dembeds, dim=0)
+        _, rel_hid = self._rnn2(hist_rfeats)
+        rel_hid = torch.squeeze(rel_hid, dim=0)
 
         graph_pred_embed = torch.max_pool1d(
             hist_nfeats.transpose(-1, -2), len(hist_graphs)
         ).squeeze(dim=-1)
         rel_pred_embed = torch.cat(
-            [graph_pred_embed[subj], self.ent_embeds[subj], ent_dembeds[subj]],
+            [graph_pred_embed[subj], self.ent_emb[subj], ent_hid[subj]],
             dim=-1,
         )
         rel_logit = self._linear1(rel_pred_embed)
         obj_pred_embed = torch.cat(
-            [rel_pred_embed, self.rel_embeds[rel], rel_dembeds[rel]], dim=-1
+            [rel_pred_embed, self.rel_emb[rel], rel_hid[rel]], dim=-1
         )
         ent_logit = self._linear2(obj_pred_embed)
         return {"obj_logit": ent_logit * rel_logit, "rel_logit": rel_logit}
@@ -75,7 +71,7 @@ class EvoKg(torch.nn.Module):
         """
         # (num_rels, num_nodes)
         rel_node_mask = node_feats.new_zeros(
-            self.rel_embeds.size(0), node_feats.size(0), dtype=torch.bool
+            self.rel_emb.size(0), node_feats.size(0), dtype=torch.bool
         )
         src, dst, eids = graph.edges("all")
         rel_ids = graph.edata["rid"][eids]

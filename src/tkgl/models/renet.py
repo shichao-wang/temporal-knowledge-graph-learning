@@ -5,6 +5,8 @@ import torch
 from dgl.udf import EdgeBatch
 from torch import nn
 
+from tkgl.models.tkgr_model import TkgrModel
+
 
 def edge_neighbor_subgraph(graph: dgl.DGLGraph, ent_ids: torch.Tensor):
     def is_adj(edges: EdgeBatch):
@@ -35,21 +37,21 @@ def node_neighbor_subgraph(graph: dgl.DGLGraph, ent_ids: torch.Tensor):
     return sg
 
 
-class RENet(torch.nn.Module):
+class RENet(TkgrModel):
     def __init__(
         self, num_ents: int, num_rels: int, hidden_size: int, num_layers: int
     ):
-        super().__init__()
+        super().__init__(num_ents, num_rels, hidden_size)
 
         self._rgcn = RelGraphConv(hidden_size, hidden_size, num_layers)
 
         self._obj_decoder = RecurrentE(num_ents, hidden_size, hidden_size)
         self._rel_decoder = RecurrentR(num_rels, hidden_size, hidden_size)
 
-        self.ent_embeds = nn.Parameter(torch.zeros(num_ents, hidden_size))
-        self.rel_embeds = nn.Parameter(torch.zeros(num_rels, hidden_size))
-        nn.init.xavier_normal_(self.ent_embeds)
-        nn.init.xavier_uniform_(self.rel_embeds)
+        self.ent_emb = nn.Parameter(torch.zeros(num_ents, hidden_size))
+        self.rel_emb = nn.Parameter(torch.zeros(num_rels, hidden_size))
+        nn.init.xavier_normal_(self.ent_emb)
+        nn.init.xavier_uniform_(self.rel_emb)
 
     def forward(
         self,
@@ -62,7 +64,7 @@ class RENet(torch.nn.Module):
             edge_neighbor_subgraph(graph, subj) for graph in hist_graphs
         ]
         bg = dgl.batch(subj_hists)
-        node_feats = self._rgcn(bg, self.ent_embeds, self.rel_embeds)
+        node_feats = self._rgcn(bg, self.ent_emb, self.rel_emb)
         batch_num_nodes_list = bg.batch_num_nodes().tolist()
         total_feats_split = torch.split(node_feats, batch_num_nodes_list)
         total_ent_split = torch.split(bg.ndata["ent_id"], batch_num_nodes_list)
@@ -74,37 +76,37 @@ class RENet(torch.nn.Module):
 
         # (hist_len, 3 * h)
         obj_logit = self._obj_decoder(
-            self.ent_embeds, self.rel_embeds, subj, rel, subj_embeds
+            self.ent_emb, self.rel_emb, subj, rel, subj_embeds
         )
-        rel_logit = self._rel_decoder(self.ent_embeds, subj, obj, subj_embeds)
+        rel_logit = self._rel_decoder(self.ent_emb, subj, obj, subj_embeds)
         return {"obj_logit": obj_logit, "rel_logit": rel_logit}
 
 
 class RecurrentE(torch.nn.Module):
     def __init__(self, num_classes: int, input_size: int, hidden_size: int):
         super().__init__()
-        self._rnn = nn.GRU(3 * input_size, hidden_size, batch_first=True)
-        self._linear = nn.Linear(2 * input_size + hidden_size, num_classes)
+        self.rnn = nn.GRU(3 * input_size, hidden_size, batch_first=True)
+        self.linear = nn.Linear(2 * input_size + hidden_size, num_classes)
 
     def forward(
         self,
-        ent_embeds: torch.Tensor,
-        rel_embeds: torch.Tensor,
+        ent_emb: torch.Tensor,
+        rel_emb: torch.Tensor,
         subj: torch.Tensor,
         rel: torch.Tensor,
         subj_embeds: torch.Tensor,
     ):
         hist_len = subj_embeds.size(1)
-        ex_ent_embeds = ent_embeds[subj].unsqueeze(1).repeat(1, hist_len, 1)
-        ex_rel_embeds = rel_embeds[rel].unsqueeze(1).repeat(1, hist_len, 1)
+        ex_ent_embeds = ent_emb[subj].unsqueeze(1).repeat(1, hist_len, 1)
+        ex_rel_embeds = rel_emb[rel].unsqueeze(1).repeat(1, hist_len, 1)
         # (num_preds, hist_len, h)
         inputs = torch.cat([subj_embeds, ex_ent_embeds, ex_rel_embeds], dim=-1)
-        _, output = self._rnn(inputs)
+        _, output = self.rnn(inputs)
         x = torch.cat(
-            [ent_embeds[subj], rel_embeds[rel], torch.squeeze(output, dim=0)],
+            [ent_emb[subj], rel_emb[rel], torch.squeeze(output, dim=0)],
             dim=-1,
         )
-        logit = self._linear(x)
+        logit = self.linear(x)
         return logit
 
 

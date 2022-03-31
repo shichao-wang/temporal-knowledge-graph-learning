@@ -5,6 +5,7 @@ import molurus
 import torch
 from tallow.nn import forwards
 
+from tkgl.models.regcn import OmegaRelGraphConv
 from tkgl.modules.convtranse import ConvTransE
 from tkgl.modules.mrgcn import MultiRelGraphConv
 
@@ -30,7 +31,7 @@ class RelGraphConvRerank(RerankTkgrModel):
             num_ents, num_rels, pretrained_backbone, finetune, config_path
         )
         self.k = k
-        self.rgcn = MultiRelGraphConv(
+        self.rgcn = OmegaRelGraphConv(
             self.hidden_size,
             self.hidden_size,
             rgcn_num_layers,
@@ -79,7 +80,7 @@ class RelGraphConvRerank(RerankTkgrModel):
             torch.argsort(candidate_subgraph.ndata["eid"])
         ]
         pred_inp = torch.stack([enhanced_ent_emb[subj], rel_emb[rel]], dim=1)
-        obj_logit = self.obj_score(pred_inp) @ enhanced_ent_emb.t()
+        obj_logit = self.obj_score(pred_inp) @ ent_emb.t()
         return {
             "obj_logit": obj_logit,
             "obj_logit_orig": obj_logit_orig,

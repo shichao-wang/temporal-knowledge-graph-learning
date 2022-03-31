@@ -86,7 +86,7 @@ class ComplexEvoNet(TkgrModel):
 
         return {
             "hist_obj_logit": hist_obj_logit,
-            "hist_ent_emb": hist_ent_emb,
+            # "hist_ent_emb": hist_ent_emb,
             "obj_logit": obj_logit,  # used for prediction
         }
 

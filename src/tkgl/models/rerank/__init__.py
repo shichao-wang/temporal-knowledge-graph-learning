@@ -1,5 +1,5 @@
 from .rerank import RerankLoss, RerankTkgrModel
-from .rgat_rerank import RelGatRerank
+from .rgat import RelGatRerank
 from .rgcn_rerank import RelGraphConvRerank
 from .triplet_rerank import TripletRerank
 

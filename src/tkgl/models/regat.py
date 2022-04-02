@@ -107,8 +107,4 @@ class REGAT(TkgrModel):
 
         obj_inp = torch.stack([ent_emb[subj], rel_emb[rel]], dim=1)
         obj_logit = self.convtranse(obj_inp) @ ent_emb.t()
-        return {
-            "obj_logit": obj_logit,
-            "hist_ent_emb": hist_ent_emb,
-            "hist_rel_emb": hist_rel_emb,
-        }
+        return {"obj_logit": obj_logit, "ent_emb": ent_emb, "rel_emb": rel_emb}

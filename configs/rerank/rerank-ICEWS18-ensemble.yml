@@ -6,12 +6,12 @@ data:
   shuffle_seed: 1234
 
 model:
-  _class: tkgl.models.rerank.RelGraphConvRerank
+  _class: tkgl.models.rerank.rgat.RelGatRerank
   pretrained_backbone: null
   finetune: false
   k: 10
   rgcn_num_layers: 2
-  rgcn_self_loop: true
+  rgcn_num_heads: 4
   convtranse_kernel_size: 3
   convtranse_num_channels: 50
   dropout: 0.2

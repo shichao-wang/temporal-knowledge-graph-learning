@@ -6,15 +6,17 @@ data:
   shuffle_seed: 1234
 
 model:
-  _class: tkgl.models.hiertkgr.HighwayTkgr
+  _class: tkgl.models.regat.REGAT
   hidden_size: 200
   rgcn_num_layers: 2
   rgcn_num_heads: 4
+  convtranse_kernel_size: 3
+  convtranse_channels: 50
   dropout: 0.2
 
 training:
   criterion:
-    _class: tkgl.models.cen.HistEntLoss
+    _class: tkgl.models.EntLoss
   optim:
     _class: torch.optim.Adam
     lr: 1.0e-3

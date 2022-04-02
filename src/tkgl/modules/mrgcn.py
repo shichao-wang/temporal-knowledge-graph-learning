@@ -2,22 +2,21 @@ from typing import Callable
 
 import dgl
 import torch
-from dgl.udf import EdgeBatch
+from dgl.udf import EdgeBatch, NodeBatch
 
 
 class MultiRelGraphLayer(torch.nn.Module):
     def __init__(
-        self, input_size: int, hidden_size: int, self_loop: bool, dropout: float
+        self, input_size: int, hidden_size: int, num_heads: int, dropout: float
     ):
         super().__init__()
-        self.neigh_linear = torch.nn.Linear(2 * input_size, hidden_size)
-        self._self_loop = self_loop
-
+        self.trip_linear = torch.nn.Linear(3 * input_size, hidden_size)
+        self.trip_score_linear = torch.nn.Sequential(
+            torch.nn.Linear(hidden_size, num_heads), torch.nn.LeakyReLU()
+        )
         self._dropout = torch.nn.Dropout(dropout)
         self._activation = torch.nn.RReLU()
-
-        if self._self_loop:
-            self.looplinear = torch.nn.Linear(input_size, hidden_size)
+        self.selflinear = torch.nn.Linear(input_size, hidden_size)
 
     def forward(
         self,
@@ -26,23 +25,42 @@ class MultiRelGraphLayer(torch.nn.Module):
         edge_feats: torch.Tensor,
     ):
         def message_fn(edges: EdgeBatch):
-            msg_inp = torch.cat([edges.src["h"], edges.data["h"]], dim=-1)
-            msg = self.neigh_linear(msg_inp)
-            return {"msg": msg}
+            trip_inp = torch.cat(
+                [edges.data["h"], edges.src["h"], edges.dst["h"]], dim=-1
+            )
+            trip_hid = self.trip_linear(trip_inp)
+            return {"trip_hid": trip_hid}
+
+        # def reduce_fn(nodes: NodeBatch):
+        #     """
+        #     (N, K, H)
+        #     """
+        #     weights = torch.softmax(nodes.mailbox["trip_score"], dim=1)
+        #     in_msg = weights.transpose(-1, -2) @ nodes.mailbox["trip_msg"]
+        #     return {"in_msg": torch.mean(in_msg, dim=1)}
 
         with graph.local_scope():
             graph.ndata["h"] = node_feats
             graph.edata["h"] = edge_feats
-            # node msg
-            graph.update_all(message_fn, dgl.function.mean("msg", "msg"))
 
-            neigh_msg = graph.ndata["msg"]
+            graph.apply_edges(message_fn)
+            trip_score = self.trip_score_linear(graph.edata["trip_hid"])
+            trip_head_weights = dgl.ops.edge_softmax(
+                graph, torch.unsqueeze(trip_score, dim=-1)
+            )
+            trip_weight = torch.mean(trip_head_weights, dim=1)
+            graph.edata["trip_hid_w"] = trip_weight * graph.edata["trip_hid"]
 
-        if self._self_loop:
-            self_msg = self.looplinear(node_feats)
-            neigh_msg = neigh_msg + self_msg
-        neigh_msg = self._activation(node_feats)
-        return self._dropout(neigh_msg)
+            graph.update_all(
+                dgl.function.copy_edge("trip_hid_w", "trip_hid_w"),
+                dgl.function.sum("trip_hid_w", "trip_msg"),
+            )
+            in_msg = graph.ndata["trip_msg"]
+
+        self_msg = self.selflinear(node_feats)
+        node_feats = in_msg + self_msg
+        node_feats = self._activation(node_feats)
+        return self._dropout(node_feats)
 
 
 class MultiRelGraphConv(torch.nn.Module):
@@ -50,17 +68,18 @@ class MultiRelGraphConv(torch.nn.Module):
         self,
         input_sizse: int,
         hidden_size: int,
+        num_heads: int,
         num_layers: int,
-        self_loop: bool,
         dropout: float,
     ):
         super().__init__()
-        layer = MultiRelGraphLayer
-        _layers = [layer(input_sizse, hidden_size, self_loop, dropout)]
+        nlayer = MultiRelGraphLayer
+        _nlayers = [nlayer(input_sizse, hidden_size, num_heads, dropout)]
         for _ in range(1, num_layers):
-            _layers.append(layer(hidden_size, hidden_size, self_loop, dropout))
-        self.layers = torch.nn.ModuleList(_layers)
-        self.olinear = torch.nn.Linear(hidden_size * num_layers, hidden_size)
+            _nlayers.append(
+                nlayer(hidden_size, hidden_size, num_heads, dropout)
+            )
+        self.nlayers = torch.nn.ModuleList(_nlayers)
 
     __call__: Callable[
         [
@@ -78,11 +97,6 @@ class MultiRelGraphConv(torch.nn.Module):
         node_feats: torch.Tensor,
         edge_feats: torch.Tensor,
     ):
-        neigh_feats = node_feats
-        neigh_msg_list = []
-        for layer in self.layers:
-            neigh_feats = layer(graph, neigh_feats, edge_feats)
-            neigh_msg_list.append(neigh_feats)
-
-        multihop_neighbor = torch.cat(neigh_msg_list, dim=-1)
-        return self.olinear(multihop_neighbor)
+        for layer in self.nlayers:
+            node_feats = layer(graph, node_feats, edge_feats)
+        return node_feats

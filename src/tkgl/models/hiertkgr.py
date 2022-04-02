@@ -8,10 +8,10 @@ from numpy import tri
 from tallow.nn import forwards, positional_encoding
 from torch.nn import functional as f
 
-from tkgl.modules.convtranse import ConvTransE
 from tkgl.models.regcn import OmegaRelGraphConv
 from tkgl.models.tkgr_model import TkgrModel
 from tkgl.modules.compgcn import CompGCN
+from tkgl.modules.convtranse import ConvTransE
 from tkgl.modules.mrgcn import MultiRelGraphConv
 from tkgl.modules.rgat import RelGat
 
@@ -27,7 +27,10 @@ def group_reduce_nodes(
     *,
     reducer: str = "mean",
 ):
-    rn_mask = build_r2n_mask(graph, edge_types, num_nodes, num_rels)
+    in_degree, out_degree = build_r2n_degree(
+        graph, edge_types, num_rels, num_nodes
+    )
+    rn_mask = torch.bitwise_or(in_degree.bool(), out_degree.bool())
 
     nids = torch.nonzero(rn_mask)[:, 1]
     rel_emb = dgl.ops.segment_reduce(
@@ -52,25 +55,26 @@ def graph_to_triplets(
     return torch.stack(embed_list, dim=1)
 
 
-def build_r2n_mask(
+def build_r2n_degree(
     graph: dgl.DGLGraph,
     edge_types: torch.Tensor,
+    num_rels: int,
     num_nodes: int = None,
-    num_rels: int = None,
 ):
     if num_nodes is None:
         num_nodes = graph.num_nodes()
-    if num_rels is None:
-        num_rels = edge_types.max()
 
-    rn_mask = torch.zeros(
-        num_rels, num_nodes, dtype=torch.bool, device=graph.device
+    in_degrees = torch.zeros(
+        num_rels, num_nodes, dtype=torch.long, device=graph.device
+    )
+    out_degrees = torch.zeros(
+        num_rels, num_nodes, dtype=torch.long, device=graph.device
     )
     src, dst, eids = graph.edges("all")
     rel_ids = edge_types[eids]
-    rn_mask[rel_ids, src] = True
-    rn_mask[rel_ids, dst] = True
-    return rn_mask
+    in_degrees[rel_ids, src] += 1
+    out_degrees[rel_ids, dst] += 1
+    return in_degrees, out_degrees
 
 
 class HighwayTkgr(TkgrModel):
@@ -80,18 +84,19 @@ class HighwayTkgr(TkgrModel):
         num_rels: int,
         hidden_size: int,
         rgcn_num_layers: int,
-        rgcn_self_loop: bool,
+        rgcn_num_heads: bool,
         dropout: float,
     ):
         super().__init__(num_ents, num_rels, hidden_size)
         self.mrgcn = MultiRelGraphConv(
-            hidden_size, hidden_size, rgcn_num_layers, rgcn_self_loop, dropout
+            hidden_size, hidden_size, rgcn_num_layers, rgcn_num_heads, dropout
         )
+        self.relrnn = torch.nn.GRUCell(2 * hidden_size, hidden_size)
         self.transformer_encoder = torch.nn.TransformerEncoder(
             torch.nn.TransformerEncoderLayer(hidden_size, 4, dropout=dropout),
             num_layers=2,
         )
-        self.glinear = torch.nn.Linear()
+        self.tuplinear = torch.nn.Linear(2 * hidden_size, hidden_size)
         self.convtranse = ConvTransE(hidden_size, 2, 50, 3, dropout)
 
     def forward(
@@ -102,18 +107,34 @@ class HighwayTkgr(TkgrModel):
     ):
         ent_emb = f.normalize(self.ent_emb)
 
-        bg = dgl.batch(hist_graphs)
-        total_neighbor_emb = self.mrgcn(
-            bg, ent_emb[bg.ndata["eid"]], self.rel_emb[bg.edata["rid"]]
-        )
-        # lf means seqlen first
-        hist_neigh_emb = torch.stack(
-            torch.split_with_sizes(
-                total_neighbor_emb, bg.batch_num_nodes().tolist()
-            ),
-            dim=0,
-        )
-        hist_ent_emb = self.ent_emb.unsqueeze(dim=0) + hist_neigh_emb
+        hist_ent_emb_list = []
+        hist_rel_emb_list = []
+        for graph in hist_graphs:
+            # Update for connected nodes
+            node_feats = self.mrgcn(
+                graph,
+                ent_emb[graph.ndata["eid"]],
+                self.rel_emb[graph.edata["rid"]],
+            )
+            g_ent_emb = node_feats[torch.argsort(graph.ndata["eid"])]
+            hist_ent_emb_list.append(g_ent_emb)
+
+            in_mask, out_mask = build_r2n_degree(
+                graph, graph.edata["rid"], self.num_rels
+            )
+            in_hid = (in_mask @ ent_emb) / torch.sum(
+                in_mask, dim=1, keepdim=True
+            )
+            out_hid = (out_mask @ ent_emb) / torch.sum(
+                out_mask, dim=1, keepdim=True
+            )
+            e = torch.cat([in_hid, out_hid], dim=-1)
+            g_rel_emb = self.relrnn(e, self.rel_emb)
+            hist_rel_emb_list.append(g_rel_emb)
+
+        hist_ent_emb = torch.stack(hist_ent_emb_list)
+        hist_rel_emb = torch.stack(hist_rel_emb_list)
+
         hist_len = len(hist_graphs)
         mask = torch.triu(
             hist_ent_emb.new_ones((hist_len, hist_len), dtype=torch.bool)
@@ -122,8 +143,9 @@ class HighwayTkgr(TkgrModel):
         hist_obj_logit_list = []
         for i in range(hist_len):
             ent_emb = hist_ent_emb[i]
-            obj_inp = torch.stack([ent_emb[subj], self.rel_emb[rel]], dim=1)
-            obj_logit = self.convtranse(obj_inp) @ ent_emb.t()
+            rel_emb = hist_rel_emb[i]
+            obj_inp = torch.stack([ent_emb[subj], rel_emb[rel]], dim=1)
+            obj_logit = self.convtranse(obj_inp) @ self.ent_emb.t()
             hist_obj_logit_list.append(obj_logit)
 
         hist_obj_logit = torch.stack(hist_obj_logit_list)

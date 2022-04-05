@@ -1,5 +1,5 @@
 data:
-  data_folder: "./datasets/GDELT"
+  data_folder: "./datasets/YAGO"
   hist_len: 1 
   bidirectional: true
   prepend_val_and_test: true
@@ -24,8 +24,8 @@ training:
   patient: 5
   grad_clip_norm: 1.0
 
-hpspace:
-  data.hist_len: [1, 2, 3, 4, 6, 8, 10]
-  # model.rgcn_num_layers: [2, 3]
-  # model.rgcn_num_heads: [4, 8]
-  # model.dropout: [0.2, 0.3]
+# hpspace:
+#   data.hist_len: [2, 4, 6, 8, 10]
+#   model.num_layers: [1, 2, 3]
+#   model.dropout: [0.1, 0.2, 0.3]
+#   training.lr: [1.0e-3, 5.0e-4]

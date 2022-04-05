@@ -1,0 +1,42 @@
+data:
+  data_folder: "./datasets/GDELT"
+  hist_len: 1 
+  bidirectional: true
+  prepend_val_and_test: true
+  shuffle_seed: 1234
+
+model:
+  _class: tkgl.models.rerank.rgat.RelGatRerank
+  pretrained_backbone: null
+  finetune: false
+  k: 10
+  rgcn_num_layers: 2
+  rgcn_num_heads: 4
+  convtranse_kernel_size: 3
+  convtranse_num_channels: 50
+  dropout: 0.2
+
+
+training:
+  criterion:
+    _class: "tkgl.models.EntLoss"
+    # alpha: 0.7
+  optim:
+    _class: "torch.optim.Adam"
+    lr: 1.0e-3
+    weight_decay: 1.0e-5
+  patient: 5
+  grad_clip_norm: 1.0
+
+# hpspace:
+  # model.k: [1,2,3,4,5,6,7,8,9,10]
+  # model.num_heads: [1,4,8]
+  # model.num_layers: [1,2,3]
+  # training.optim.lr:
+  #   - 1.0e-4
+  #   - 5.0e-4
+  #   - 1.0e-3
+  # training.criterion.beta: 
+  #   - 0.0
+  #   - 1.0
+

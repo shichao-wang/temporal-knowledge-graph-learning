@@ -193,8 +193,8 @@ class REGCN(TkgrModel):
         return {
             "obj_logit": obj_logit,
             "rel_logit": rel_logit,
-            "hist_ent_emb": hist_ent_emb,
-            "hist_rel_emb": hist_rel_emb,
+            "ent_emb": ent_emb,
+            "rel_emb": rel_emb,
         }
 
     def _origin_or_norm(self, tensor: torch.Tensor):

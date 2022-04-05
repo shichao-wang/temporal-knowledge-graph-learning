@@ -199,7 +199,7 @@ def load_txt_vocab(txt_file: str, sep: str = "\t") -> Vocab:
     item2id = {}
     with open(txt_file) as fp:
         for line in fp:
-            item, ind = line.strip().split(sep)
+            item, ind, *_ = line.strip().split(sep)
             ind = int(ind)
             item2id[item] = ind
     return Vocab(item2id)

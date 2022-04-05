@@ -1,7 +1,6 @@
 data:
   data_folder: "./datasets/GDELT"
   hist_len: 1 
-  hist_len: 6 
   bidirectional: true
   prepend_val_and_test: true
   shuffle_seed: 1234
